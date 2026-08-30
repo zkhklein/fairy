@@ -1,0 +1,33 @@
+{
+  "name": "fairy-maid-brigade",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Fairy Maid Brigade - A cross-PC plugin-based inter-software workflow orchestration platform.",
+  "main": "out/main/index.js",
+  "author": "Fairy Maid Brigade",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20",
+    "pnpm": ">=9"
+  },
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "build:win": "electron-vite build && electron-builder --win --x64",
+    "typecheck": "tsc --noEmit -p tsconfig.main.json && tsc --noEmit -p tsconfig.renderer.json && tsc --noEmit -p tsconfig.shared.json",
+    "format": "prettier --write \"src/**/*.ts\" \"src/**/*.tsx\""
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/react": "^18.2.48",
+    "@types/react-dom": "^18.2.18",
+    "electron": "^30.0.0",
+    "electron-vite": "^2.1.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "typescript": "^5.3.3",
+    "vite": "^5.0.12",
+    "@vitejs/plugin-react": "^4.2.1"
+  },
+  "dependencies": {}
+}

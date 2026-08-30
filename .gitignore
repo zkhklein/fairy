@@ -1,0 +1,63 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+.yarn/install-state.gz
+
+# Build outputs
+dist/
+out/
+dist-electron/
+release/
+*.exe
+*.msi
+*.zip
+!plugins-dist/.gitkeep
+plugins-dist/*
+!plugins-dist/.gitkeep
+
+# Cache
+.vite/
+.cache/
+.parcel-cache/
+.eslintcache
+.stylelintcache
+.turbo/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Env & secrets
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# Test / coverage
+coverage/
+*.lcov
+.nyc_output/
+
+# Spec Mode artifacts (ignored by git but retained locally)
+# .trae/specs/ should be committed (spec mode artifacts)

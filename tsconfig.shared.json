@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "out/shared",
+    "declaration": true,
+    "emitDeclarationOnly": true,
+    "types": ["node"],
+    "baseUrl": ".",
+    "paths": {}
+  },
+  "include": ["src/shared/**/*.ts"]
+}
