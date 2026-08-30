@@ -4,9 +4,22 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+// eslint-disable-next-line node/prefer-global/process
 process.env['ELECTRON_DISABLE_SECURITY_WARNINGS'] = 'true';
 
+const FALLBACK_DEV_SERVER_URL = 'http://localhost:5173';
+
 let mainWindow: BrowserWindow | null = null;
+
+function resolveRendererEntry(): { mode: 'url'; url: string } | { mode: 'file'; file: string } {
+  if (!app.isPackaged) {
+    // eslint-disable-next-line node/prefer-global/process
+    const fromEnv = process.env['VITE_DEV_SERVER_URL'] || process.env.VITE_DEV_SERVER_URL;
+    const url = (typeof fromEnv === 'string' && fromEnv.length > 0) ? fromEnv : FALLBACK_DEV_SERVER_URL;
+    return { mode: 'url', url };
+  }
+  return { mode: 'file', file: path.join(__dirname, '../renderer/index.html') };
+}
 
 function createWindow(): void {
   mainWindow = new BrowserWindow({
@@ -25,14 +38,27 @@ function createWindow(): void {
     },
   });
 
-  mainWindow.on('ready-to-show', () => {
+  mainWindow.once('ready-to-show', () => {
     mainWindow?.show();
   });
 
-  if (process.env['VITE_DEV_SERVER_URL']) {
-    void mainWindow.loadURL(process.env['VITE_DEV_SERVER_URL']);
+  const entry = resolveRendererEntry();
+  if (entry.mode === 'url') {
+    const load = async (): Promise<void> => {
+      try {
+        await mainWindow?.loadURL(entry.url);
+      } catch (err) {
+        // Retry once against fallback URL if VITE_DEV_SERVER_URL was stale
+        if (entry.url !== FALLBACK_DEV_SERVER_URL) {
+          await mainWindow?.loadURL(FALLBACK_DEV_SERVER_URL);
+          return;
+        }
+        throw err;
+      }
+    };
+    void load();
   } else {
-    void mainWindow.loadFile(path.join(__dirname, '../renderer/index.html'));
+    void mainWindow.loadFile(entry.file);
   }
 }
 
