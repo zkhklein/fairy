@@ -110,47 +110,57 @@ export class WorkflowService {
   // ---------------- Runs ----------------
 
   async run(workflowId: string, input?: Record<string, unknown>): Promise<{
-    run_id: string; workflow_id: string; status: string;
-    input_json: string; output_json: string | null; error_message: string | null;
-    duration_ms: number; created_at: number; ended_at: number | null;
+    id: string; workflow_id: string; trigger: string; status: string;
+    input_json: string; output_json: string | null;
+    started_at: number | null; finished_at: number | null;
+    created_at: number; duration_ms: number | null;
+    error_stack: string | null; trace_id: string;
     input: Record<string, unknown>; output: Record<string, unknown> | null;
   }> {
     const result = await this.execute(workflowId, { input });
     const row = getRawDb().prepare('SELECT * FROM workflow_runs WHERE id = ?').get(result.runId) as any;
     return {
-      run_id: row.id,
+      id: row.id,
       workflow_id: row.workflow_id,
+      trigger: row.trigger,
       status: row.status,
-      input_json: row.input_json,
-      output_json: row.output_json,
-      error_message: row.error_stack,
-      duration_ms: row.duration_ms,
+      input_json: row.input_json ?? '{}',
+      output_json: row.output_json ?? null,
+      started_at: row.started_at ?? null,
+      finished_at: row.finished_at ?? null,
       created_at: row.created_at,
-      ended_at: row.finished_at,
+      duration_ms: (row.duration_ms == null) ? null : Number(row.duration_ms),
+      error_stack: row.error_stack ?? null,
+      trace_id: row.trace_id,
       input: row.input_json ? JSON.parse(row.input_json) : {},
       output: row.output_json ? JSON.parse(row.output_json) : null,
     };
   }
 
   cancelRun(runId: string): {
-    run_id: string; workflow_id: string; status: string;
-    input_json: string; output_json: string | null; error_message: string | null;
-    duration_ms: number; created_at: number; ended_at: number | null;
+    id: string; workflow_id: string; trigger: string; status: string;
+    input_json: string; output_json: string | null;
+    started_at: number | null; finished_at: number | null;
+    created_at: number; duration_ms: number | null;
+    error_stack: string | null; trace_id: string;
     input: Record<string, unknown>; output: Record<string, unknown> | null;
   } {
     const db = getRawDb();
     db.prepare(`UPDATE workflow_runs SET status='cancelled', finished_at=? WHERE id=? AND status IN ('running','pending')`).run(Date.now(), runId);
     const row = db.prepare('SELECT * FROM workflow_runs WHERE id = ?').get(runId) as any;
     return {
-      run_id: row.id,
+      id: row.id,
       workflow_id: row.workflow_id,
+      trigger: row.trigger,
       status: row.status,
-      input_json: row.input_json,
-      output_json: row.output_json,
-      error_message: row.error_stack,
-      duration_ms: row.duration_ms,
+      input_json: row.input_json ?? '{}',
+      output_json: row.output_json ?? null,
+      started_at: row.started_at ?? null,
+      finished_at: row.finished_at ?? null,
       created_at: row.created_at,
-      ended_at: row.finished_at,
+      duration_ms: (row.duration_ms == null) ? null : Number(row.duration_ms),
+      error_stack: row.error_stack ?? null,
+      trace_id: row.trace_id,
       input: row.input_json ? JSON.parse(row.input_json) : {},
       output: row.output_json ? JSON.parse(row.output_json) : null,
     };
@@ -158,9 +168,11 @@ export class WorkflowService {
 
   listRuns(params: { page?: number; pageSize?: number; workflowId?: string; status?: string } = {}): {
     items: Array<{
-      run_id: string; workflow_id: string; status: string;
-      input_json: string; output_json: string | null; error_message: string | null;
-      duration_ms: number; created_at: number; ended_at: number | null;
+      id: string; workflow_id: string; trigger: string; status: string;
+      input_json: string; output_json: string | null;
+      started_at: number | null; finished_at: number | null;
+      created_at: number; duration_ms: number | null;
+      error_stack: string | null; trace_id: string;
       input: Record<string, unknown>; output: Record<string, unknown> | null;
     }>;
     total: number; page: number; pageSize: number;
@@ -175,9 +187,18 @@ export class WorkflowService {
     const pageSize = params.pageSize ?? 20;
     const start = (page - 1) * pageSize;
     const items = rows.slice(start, start + pageSize).map((r) => ({
-      run_id: r.id, workflow_id: r.workflow_id, status: r.status,
-      input_json: r.input_json, output_json: r.output_json, error_message: r.error_stack,
-      duration_ms: r.duration_ms, created_at: r.created_at, ended_at: r.finished_at,
+      id: r.id,
+      workflow_id: r.workflow_id,
+      trigger: r.trigger,
+      status: r.status,
+      input_json: r.input_json ?? '{}',
+      output_json: r.output_json ?? null,
+      started_at: r.started_at ?? null,
+      finished_at: r.finished_at ?? null,
+      created_at: r.created_at,
+      duration_ms: (r.duration_ms == null) ? null : Number(r.duration_ms),
+      error_stack: r.error_stack ?? null,
+      trace_id: r.trace_id,
       input: r.input_json ? JSON.parse(r.input_json) : {},
       output: r.output_json ? JSON.parse(r.output_json) : null,
     }));

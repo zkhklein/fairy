@@ -1,3 +1,5 @@
+import React from 'react';
+
 /**
  * Queue monitoring page — list jobs, cancel pending/running or retry failed/dead.
  * Four states via PageShell.

@@ -1,3 +1,5 @@
+import React from 'react';
+
 /**
  * Dashboard page (Task 11 / FR-1.2).
  *

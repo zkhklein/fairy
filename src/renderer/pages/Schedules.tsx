@@ -1,3 +1,5 @@
+import React from 'react';
+
 /**
  * Schedules page — list/create/toggle/delete Cron/one-shot schedules.
  * Four states via PageShell.

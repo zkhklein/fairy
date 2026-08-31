@@ -1,10 +1,12 @@
+import React from 'react';
+
 /**
  * Route definition + left-nav config for TR-10.1 (8 navigation items).
  *
  * Each entry is a single source of truth used in:
  *   - AntD Sider Menu item rendering (`Menu.menuItems` with <NavigateOutlined> icons)
  *   - Top breadcrumb generation (traverse `items` to find matching label by path)
- *   - React Router 6 `createBrowserRouter` table
+ *   - React Router 6 `createHashRouter` table (HashRouter: dev http:// + packaged file://)
  *
  * The 8 pages are:
  *   1. /dashboard          — Dashboard（仪表盘 / 总览）

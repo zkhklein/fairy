@@ -1,3 +1,5 @@
+import React from 'react';
+
 /**
  * Error Calendar page — query error logs by severity + date range + mark resolved.
  * Four states via PageShell.

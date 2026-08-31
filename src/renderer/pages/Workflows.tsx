@@ -1,3 +1,5 @@
+import React from 'react';
+
 /**
  * Workflows page — list + create/delete/run actions.
  * Four states are delegated to PageShell.

@@ -25,7 +25,16 @@ import { startHttpServer } from './http';
 import type { HttpServerHandle } from './http';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const MARKER_FILE = path.join(__dirname, '../../boot-markers.log');
+// Write boot markers to userData (always writable) instead of the relative
+// path inside app.asar (read-only in packaged mode → silent write failures
+// → no diagnostic logs). In dev mode fall back to project root for convenience.
+const MARKER_FILE = (() => {
+  try {
+    return path.join(app.getPath('userData'), 'boot-markers.log');
+  } catch {
+    return path.join(__dirname, '../../boot-markers.log');
+  }
+})();
 
 // --- Self-check mode (T20): launched by scripts/self-check.ps1 with
 // `--self-check --fmb-self-check-marker=<path>`. In this mode we skip the GUI
@@ -82,13 +91,18 @@ function resolveRendererEntry(): { mode: 'url'; url: string } | { mode: 'file'; 
     const url = (typeof fromEnv === 'string' && fromEnv.length > 0) ? fromEnv : FALLBACK_DEV_SERVER_URL;
     return { mode: 'url', url };
   }
-  // Packaged: renderer sits alongside main inside the resources tree (T19 finalize layout).
-  return { mode: 'file', file: path.join(projectRoot(), 'resources', 'renderer', 'index.html') };
+  // Packaged: renderer sits inside app.asar at out/renderer/index.html.
+  // app.getAppPath() resolves to <resources>/app.asar; loadFile reads asar
+  // transparently. (Earlier code pointed at <exe>/resources/renderer/ which
+  // is outside the asar and never existed → blank window.)
+  return { mode: 'file', file: path.join(app.getAppPath(), 'out', 'renderer', 'index.html') };
 }
 
 function resolvePreloadPath(): string {
   if (app.isPackaged) {
-    return path.join(projectRoot(), 'resources', 'preload', 'index.js');
+    // Preload lives inside app.asar at out/preload/index.js. Electron loads
+    // preload scripts from asar transparently.
+    return path.join(app.getAppPath(), 'out', 'preload', 'index.js');
   }
   // Dev: electron-vite emits preload CJS bundle into out/preload/ relative to project root.
   return path.join(projectRoot(), 'out', 'preload', 'index.js');
@@ -107,6 +121,14 @@ function createWindow(): void {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false,
+      // Packaged mode loads the renderer via `file://` loadFile(). Chromium's
+      // default webSecurity=true enforces CORS on ES module scripts under
+      // file:// (the file:// origin cannot serve CORS headers), which silently
+      // blocks `<script type=module crossorigin>` → bundle never loads → blank
+      // window. Disabling webSecurity for packaged mode allows file:// to load
+      // ES modules transparently. Dev mode (http://localhost:5173) keeps
+      // webSecurity=true because http origins serve CORS headers correctly.
+      webSecurity: !app.isPackaged,
       preload: resolvePreloadPath(),
     },
   });
@@ -146,6 +168,25 @@ function createWindow(): void {
     void load();
   } else {
     void mainWindow.loadFile(entry.file);
+  }
+
+  // Diagnostic: confirm renderer actually mounted (blank-window debugging).
+  const wc = mainWindow.webContents;
+  wc.on('did-fail-load', (_e, code, desc, url) => mk('RENDERER_FAIL_LOAD', { code, desc, url, triedEntry: entry }));
+  wc.on('did-finish-load', () => {
+    mk('RENDERER_FINISH_LOAD', { url: wc.getURL(), isPackaged: app.isPackaged });
+    wc.executeJavaScript(
+      `(document.getElementById('root')?.children.length||0) + ':' + (document.body?.children.length||0)`,
+    )
+      .then((cnt: string) => mk('RENDERER_DOM', { rootChildren: cnt }))
+      .catch((err: unknown) => mk('RENDERER_DOM_ERR', { msg: (err as Error).message }));
+  });
+  // Temporarily auto-open DevTools in packaged mode for blank-screen diagnosis.
+  // TODO: remove once root cause is fixed.
+  if (app.isPackaged) {
+    wc.on('dom-ready', () => {
+      wc.openDevTools({ mode: 'detach' });
+    });
   }
 }
 

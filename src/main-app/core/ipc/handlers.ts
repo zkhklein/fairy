@@ -210,9 +210,9 @@ export function registerIpcHandlers(ctx: IpcRegistry): () => void {
         id: vm.id, name: vm.name, description: vm.description,
         definition: vm.definition, vars: vm.vars,
       },
-      recentRuns: (runs.items as Array<{ run_id: string; status: string; created_at: number | null; ended_at: number | null; duration_ms: number | null; error_message: string | null }>).map((r) => ({
-        run_id: r.run_id, status: r.status, created_at: r.created_at, ended_at: r.ended_at,
-        duration_ms: r.duration_ms, error_message: r.error_message,
+      recentRuns: (runs.items as Array<{ id: string; status: string; created_at: number; finished_at: number | null; duration_ms: number | null; error_stack: string | null }>).map((r) => ({
+        run_id: r.id, status: r.status, created_at: r.created_at, ended_at: r.finished_at,
+        duration_ms: r.duration_ms, error_message: r.error_stack,
       })),
     };
     return {

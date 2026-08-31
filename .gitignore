@@ -80,6 +80,11 @@ scripts/verify_task2.cjs
 # electron-builder output (NSIS + portable + win-unpacked) — moved off dist/ to
 # bypass app.asar lock during iterative repackaging. Never commit installers.
 dist2/
+dist3/
+dist4/
+dist5/
+dist6/
+dist*/
 
 # pnpm/npm download cache
 .npm-cache/

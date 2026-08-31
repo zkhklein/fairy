@@ -1,3 +1,5 @@
+import React from 'react';
+
 /**
  * Four-state page shell.
  *

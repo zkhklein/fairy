@@ -1,3 +1,5 @@
+import React from 'react';
+
 /**
  * Plugins page — Plugin list management.
  *

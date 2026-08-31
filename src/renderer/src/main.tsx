@@ -4,10 +4,11 @@
  * Wires up:
  *   - StrictMode
  *   - AntD ConfigProvider (locale=zhCN + compact-less tokens override kept minimal)
- *   - React Router BrowserRouter via App.tsx's `createBrowserRouter` + RouterProvider
+ *   - React Router HashRouter via App.tsx's `createHashRouter` + RouterProvider
  *
- * We intentionally use react-router's `<BrowserRouter>` default basename because
- * the renderer loads as a single HTML file (no server-side path rewriting needed).
+ * HashRouter is used (not BrowserRouter) because in packaged mode the renderer
+ * loads via `file://` loadFile(); BrowserRouter would try to match the OS file
+ * path against the route table and silently render nothing (blank screen).
  */
 import React from 'react';
 import ReactDOM from 'react-dom/client';

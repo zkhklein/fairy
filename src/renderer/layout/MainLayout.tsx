@@ -1,3 +1,5 @@
+import React from 'react';
+
 /**
  * Global layout for the FMB UI.
  *

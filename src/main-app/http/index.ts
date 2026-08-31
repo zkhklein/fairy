@@ -243,7 +243,7 @@ export function startHttpServer(opts: { bootTs: number }): HttpServerHandle | nu
     const body = await c.req.json().catch(() => ({})) as { input?: Record<string, unknown> };
     const run = await getWorkflowService().run(c.req.param('id'), body.input ?? {});
     audit({ action: 'http.workflow.run', source: 'http', actor: 'http', payload: { id: c.req.param('id') }, traceId: newTraceId() });
-    return c.json({ run_id: (run as { run_id: string }).run_id, status: (run as { status: string }).status }, 201);
+    return c.json({ run_id: (run as { id: string }).id, status: (run as { status: string }).status }, 201);
   });
 
   app.get('/api/v1/runs/:runId', (c) => {
@@ -470,7 +470,7 @@ async function rpcDispatch(r: any): Promise<unknown> {
       case 'workflow.run': {
         const p = r?.params ?? {};
         const run = await getWorkflowService().run(p.id, p.input ?? {});
-        return { jsonrpc: '2.0', id, result: { run_id: (run as { run_id: string }).run_id, status: (run as { status: string }).status } };
+        return { jsonrpc: '2.0', id, result: { run_id: (run as { id: string }).id, status: (run as { status: string }).status } };
       }
       case 'schedule.list':
         return { jsonrpc: '2.0', id, result: getSchedulerService().list({ page: 1, pageSize: 20 }) };

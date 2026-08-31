@@ -62,6 +62,38 @@ export interface QueueMetrics {
   dead: number;
 }
 
+/**
+ * Normalize a raw job_queue row to match the published JobSchema contract:
+ *   - max_attempts must be a positive integer (>= 1). Legacy DB rows or buggy
+ *     callers may have written 0 / negative values; we clamp at read time so
+ *     IPC/HTTP results never violate the Zod schema, without mutating the
+ *     stored historical value (audit integrity preserved).
+ *   - priority / attempts are coerced to safe integers because SQLite may
+ *     return non-int or NULL on older dumps.
+ *   - run_after / payload_json defaults are applied for the same reason.
+ */
+function normalizeRow(raw: any): JobRow {
+  const r: any = raw ?? {};
+  return {
+    id: Number(r.id) || 0,
+    type: r.type ?? 'system',
+    payload_json: typeof r.payload_json === 'string' ? r.payload_json : '{}',
+    priority: Math.max(0, Math.min(9, Number.isFinite(Number(r.priority)) ? Number(r.priority) : 0)),
+    status: (['pending', 'running', 'completed', 'failed', 'dead'] as const).includes(r.status)
+      ? r.status
+      : 'pending',
+    attempts: Math.max(0, Number.isFinite(Number(r.attempts)) ? Number(r.attempts) : 0),
+    max_attempts: Math.max(1, Number.isFinite(Number(r.max_attempts)) ? Number(r.max_attempts) : 3),
+    retry_backoff: r.retry_backoff === 'fixed' ? 'fixed' : 'exponential',
+    started_at: (r.started_at == null) ? null : (Number.isFinite(Number(r.started_at)) ? Number(r.started_at) : null),
+    finished_at: (r.finished_at == null) ? null : (Number.isFinite(Number(r.finished_at)) ? Number(r.finished_at) : null),
+    last_error: (r.last_error == null) ? null : String(r.last_error),
+    worker_id: (r.worker_id == null) ? null : String(r.worker_id),
+    run_after: Math.max(0, Number.isFinite(Number(r.run_after)) ? Number(r.run_after) : 0),
+    trace_id: (r.trace_id == null) ? null : String(r.trace_id),
+  };
+}
+
 export class QueueService {
   private handlers = new Map<string, JobHandler>();
   private mutex = new Mutex();
@@ -83,11 +115,11 @@ export class QueueService {
       (params.type ? ` AND type = @type` : ``) +
       (params.status ? ` AND status = @status` : ``) +
       ` ORDER BY id DESC`;
-    const rows = db.prepare(sql).all({ type: params.type, status: params.status }) as JobRow[];
+    const rows = db.prepare(sql).all({ type: params.type, status: params.status }) as any[];
     const page = params.page ?? 1;
     const pageSize = params.pageSize ?? 20;
     const start = (page - 1) * pageSize;
-    return { items: rows.slice(start, start + pageSize), total: rows.length, page, pageSize };
+    return { items: rows.slice(start, start + pageSize).map(normalizeRow), total: rows.length, page, pageSize };
   }
 
   cancel(id: number): JobRow {
@@ -124,7 +156,11 @@ export class QueueService {
     const now = Date.now();
     const payloadJson = JSON.stringify(args.payload);
     const priority = Math.max(0, Math.min(9, args.priority ?? 0));
-    const maxAttempts = args.maxAttempts ?? 3;
+    // maxAttempts must be >= 1 to match JobSchema.positive(); explicit 0 /
+    // negative inputs are silently upgraded to 1 (same behavior as Zod default
+    // of 3 but stricter: guarantee at-least-once semantics).
+    const rawMax = args.maxAttempts ?? 3;
+    const maxAttempts = Math.max(1, Number.isFinite(Number(rawMax)) ? Number(rawMax) : 3);
     const retryBackoff = args.retryBackoff ?? 'exponential';
     const runAfter = args.runAfterMs ? now + args.runAfterMs : 0;
     const traceId = args.traceId ?? nanoid(16);
@@ -146,15 +182,16 @@ export class QueueService {
 
   getJob(id: number): JobRow | null {
     const db = getRawDb();
-    return (db.prepare('SELECT * FROM job_queue WHERE id = ?').get(id) as JobRow | undefined) ?? null;
+    const raw = db.prepare('SELECT * FROM job_queue WHERE id = ?').get(id) as any;
+    return raw ? normalizeRow(raw) : null;
   }
 
   listJobs(status?: string): JobRow[] {
     const db = getRawDb();
-    if (status) {
-      return db.prepare('SELECT * FROM job_queue WHERE status = ? ORDER BY id DESC LIMIT 100').all(status) as JobRow[];
-    }
-    return db.prepare('SELECT * FROM job_queue ORDER BY id DESC LIMIT 100').all() as JobRow[];
+    const rows = status
+      ? (db.prepare('SELECT * FROM job_queue WHERE status = ? ORDER BY id DESC LIMIT 100').all(status) as any[])
+      : (db.prepare('SELECT * FROM job_queue ORDER BY id DESC LIMIT 100').all() as any[]);
+    return rows.map(normalizeRow);
   }
 
   // ---------------- Metrics ----------------

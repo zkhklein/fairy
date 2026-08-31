@@ -84,9 +84,42 @@ export default defineConfig({
     },
   },
   renderer: {
-    plugins: [react()],
+    // Force esbuild to use the automatic JSX runtime (jsx: "automatic")
+    // instead of classic (React.createElement). Without this, .tsx files
+    // that use JSX but don't `import React` (e.g. router/index.tsx) compile
+    // to `React.createElement(...)` → "React is not defined" at runtime.
+    // The @vitejs/plugin-react should default to automatic, but electron-vite
+    // overrides esbuild config — setting it here guarantees the transform.
+    esbuild: {
+      jsx: 'automatic',
+      jsxImportSource: 'react',
+    },
+    plugins: [
+      react({ jsxRuntime: 'automatic' }),
+      // Vite/Rollup auto-adds `crossorigin` to `<script type=module>` tags
+      // during production builds. Under Electron's `file://` loadFile() the
+      // file:// origin cannot serve CORS headers, so Chromium silently blocks
+      // the bundle fetch → React never mounts → blank window. webSecurity=
+      // false alone doesn't fully cover crossorigin-forced CORS-mode requests.
+      // The post-build transformIndexHtml hook strips the attribute so the
+      // script loads as a same-origin (file://) resource without CORS.
+      {
+        name: 'strip-crossorigin-for-file-protocol',
+        transformIndexHtml: {
+          order: 'post' as const,
+          handler(html: string): string {
+            return html.replace(/\s+crossorigin(="[^"]*")?/g, '');
+          },
+        },
+      },
+    ],
     build: {
       outDir: 'out/renderer',
+      // Disable Vite's auto-added `crossorigin` attribute on script tags.
+      // Under Electron's file:// protocol, crossorigin forces CORS-mode
+      // requests which file:// cannot satisfy → bundle silently fails to load.
+      // Empty string tells Vite not to emit the crossorigin attribute.
+      crossorigin: '',
       rollupOptions: {
         input: {
           index: path.resolve(__dirname, 'src/renderer/index.html'),

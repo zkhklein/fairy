@@ -1,3 +1,5 @@
+import React from 'react';
+
 /**
  * App root — defines the React Router 6 tree.
  *
@@ -16,7 +18,7 @@
  *        ├─ /settings
  *        └─ * → AntD Result 404  (TR-10.1: 导航不会把人引到这里，但需渲染)
  */
-import { Navigate, RouterProvider, createBrowserRouter } from 'react-router-dom';
+import { Navigate, RouterProvider, createHashRouter } from 'react-router-dom';
 import { Result, Button } from 'antd';
 import { useNavigate } from 'react-router-dom';
 import type { ReactNode } from 'react';
@@ -42,7 +44,13 @@ function NotFound(): JSX.Element {
   );
 }
 
-const router = createBrowserRouter([
+// HashRouter is required for the packaged Electron app: when the renderer is
+// loaded via `file://` (loadFile), BrowserRouter silently fails because
+// `window.location.pathname` is the OS file path (e.g. `/D:/.../index.html`)
+// and matches no route → blank screen. HashRouter keys routing off the URL
+// fragment (#/dashboard) which works identically under http:// (dev) and
+// file:// (packaged).
+const router = createHashRouter([
   {
     path: '/',
     element: <MainLayout />,

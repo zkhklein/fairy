@@ -17,7 +17,7 @@
     "dev": "node scripts/dev-runner.mjs",
     "build:main": "node scripts/build-main.mjs build",
     "build:cli": "node scripts/build-cli.mjs build",
-    "build": "pnpm build:main && pnpm build:cli && electron-vite build",
+    "build": "pnpm build:main && pnpm build:cli && electron-vite build && node scripts/strip-renderer-crossorigin.mjs",
     "build:icons": "node scripts/make-icons.mjs",
     "build:win": "pnpm build:icons && pnpm build && electron-builder --win --x64",
     "test:fi": "node scripts/_build-fi.mjs && node build/fault-injection.mjs",
