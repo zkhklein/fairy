@@ -1,53 +1,61 @@
-import { useEffect, useState } from 'react';
+/**
+ * App root — defines the React Router 6 tree.
+ *
+ * Layout:
+ *   /  → redirects to /dashboard (done inside MainLayout useEffect to avoid
+ *        depending on another import cycle; also we add <Navigate /> here as a
+ *        static fallback for SSR-like scenarios).
+ *   /* → <MainLayout /> (Sider + Header + Content/Outlet + Footer)
+ *        ├─ /dashboard
+ *        ├─ /plugins
+ *        ├─ /workflows
+ *        ├─ /schedules
+ *        ├─ /queue
+ *        ├─ /error-calendar
+ *        ├─ /extension-points
+ *        ├─ /settings
+ *        └─ * → AntD Result 404  (TR-10.1: 导航不会把人引到这里，但需渲染)
+ */
+import { Navigate, RouterProvider, createBrowserRouter } from 'react-router-dom';
+import { Result, Button } from 'antd';
+import { useNavigate } from 'react-router-dom';
+import type { ReactNode } from 'react';
+import MainLayout from '../layout/MainLayout';
+import { NAV_ITEMS } from '../router';
+import AppPluginPage from '../pages/AppPluginPage';
 
-declare global {
-  interface Window {
-    fmb: {
-      version: string;
-      platform: string;
-    };
-  }
-}
-
-export default function App(): JSX.Element {
-  const [platform, setPlatform] = useState<string>('');
-  const [version, setVersion] = useState<string>('');
-
-  useEffect(() => {
-    if (typeof window.fmb !== 'undefined') {
-      setVersion(window.fmb.version);
-      setPlatform(window.fmb.platform);
-    } else {
-      setVersion('dev-browser');
-      setPlatform('web');
-    }
-  }, []);
-
+function NotFound(): JSX.Element {
+  const navigate = useNavigate();
   return (
-    <div
-      style={{
-        minHeight: '100vh',
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        background: 'linear-gradient(135deg, #1e1b4b 0%, #312e81 50%, #4c1d95 100%)',
-        color: '#ffffff',
-        fontFamily:
-          '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif',
-      }}
-    >
-      <div style={{ textAlign: 'center' }}>
-        <h1 style={{ fontSize: '48px', margin: 0, letterSpacing: '-0.5px' }}>Hello FMB</h1>
-        <p style={{ fontSize: '18px', marginTop: '16px', opacity: 0.85 }}>
-          Fairy Maid Brigade v{version || '0.1.0'} · Task 1 Scaffold · Running on{' '}
-          <code style={{ background: 'rgba(255,255,255,0.15)', padding: '2px 8px', borderRadius: 4 }}>
-            {platform || 'unknown'}
-          </code>
-        </p>
-        <p style={{ marginTop: '24px', opacity: 0.6, fontSize: '14px' }}>
-          Electron + React + TypeScript · Next: Task 2 (SQLite / Kysely / Logging)
-        </p>
-      </div>
+    <div style={{ padding: 48, display: 'flex', justifyContent: 'center' }}>
+      <Result
+        status="404"
+        title="404"
+        subTitle="该页面不存在，请从左侧菜单进入功能页。"
+        extra={
+          <Button type="primary" onClick={() => navigate('/dashboard')}>
+            返回仪表盘
+          </Button>
+        }
+      />
     </div>
   );
+}
+
+const router = createBrowserRouter([
+  {
+    path: '/',
+    element: <MainLayout />,
+    children: [
+      { index: true, element: <Navigate to="/dashboard" replace /> },
+      ...NAV_ITEMS.map((it) => ({ path: it.path.replace(/^\//, ''), element: it.element as ReactNode })),
+      // T12: type=app 插件的动态子页面（不在左侧菜单，从插件管理"打开子页面"按钮跳转）
+      { path: 'app-plugins/:pluginId', element: <AppPluginPage /> },
+      { path: '*', element: <NotFound /> },
+    ],
+  },
+]);
+
+export default function App(): JSX.Element {
+  return <RouterProvider router={router} />;
 }

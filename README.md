@@ -6,18 +6,18 @@
 
 ## 项目目录约定
 
-| 目录 | 用途 |
-| --- | --- |
-| `src/main/` | Electron 主进程（核心能力：插件、工作流、调度、队列、事件、错误日历、HTTP） |
-| `src/main/preload.ts` | 安全 contextBridge IPC 暴露层（contextIsolation=true） |
-| `src/renderer/` | Electron 渲染进程（React 18 UI：主界面 + 应用插件子页面） |
-| `src/shared/` | 主 / 渲染 / 插件 三处共享：types / zod schemas / IPC 契约 / plugin-api / http-api |
-| `plugins-source/atomic/` | 原子能力插件源码（单一能力，无子页面） |
-| `plugins-source/app/` | 应用插件源码（多原子能力组合 + 唯一对应应用子页面） |
-| `plugins-source/extension/` | 拓展插件源码（挂载到核心拓展点） |
-| `plugins-dist/` | 插件编译打包产物（`.zip`） |
-| `dist/` | Electron 打包输出（安装包 / portable exe） |
-| `.trae/specs/` | Spec Mode 产物（spec.md / tasks.md / review.md） |
+| 目录                          | 用途                                                                    |
+| --------------------------- | --------------------------------------------------------------------- |
+| `src/main/`                 | Electron 主进程（核心能力：插件、工作流、调度、队列、事件、错误日历、HTTP）                          |
+| `src/main/preload.ts`       | 安全 contextBridge IPC 暴露层（contextIsolation=true）                       |
+| `src/renderer/`             | Electron 渲染进程（React 18 UI：主界面 + 应用插件子页面）                              |
+| `src/shared/`               | 主 / 渲染 / 插件 三处共享：types / zod schemas / IPC 契约 / plugin-api / http-api |
+| `plugins-source/atomic/`    | 原子能力插件源码（单一能力，无子页面）                                                   |
+| `plugins-source/app/`       | 应用插件源码（多原子能力组合 + 唯一对应应用子页面）                                           |
+| `plugins-source/extension/` | 拓展插件源码（挂载到核心拓展点）                                                      |
+| `plugins-dist/`             | 插件编译打包产物（`.zip`）                                                      |
+| `dist/`                     | Electron 打包输出（安装包 / portable exe）                                     |
+| `.trae/specs/`              | Spec Mode 产物（spec.md / tasks.md / review\.md）                         |
 
 ## 环境要求
 
@@ -56,21 +56,21 @@ pnpm typecheck
 
 ## 技术选型（v1）
 
-| 层 | 技术 |
-| --- | --- |
-| 桌面框架 | Electron 30 |
-| 构建工具 | electron-vite 2 + Vite 5 |
-| 前端 | React 18 + TypeScript 5 + Ant Design 5 + TailwindCSS + Zustand + React Router 6 |
-| 主进程 | Node.js 20 + TypeScript |
-| 数据库 | SQLite 3 + better-sqlite3 + Kysely |
-| 事件总线 | EventEmitter2（通配符 + 错误隔离） |
-| 定时任务 | node-cron + SQLite 持久化 |
-| 工作队列 | 自研 SQLite 持久化队列 + worker_threads 并发 |
-| CLI | commander.js |
-| HTTP API | hono + zod-openapi + Swagger UI + Bearer Token |
-| 日志 | pino + rotating-file-stream |
-| 打包分发 | electron-builder（Windows NSIS + portable） |
-| 插件沙箱 | node:vm + manifest.json 权限声明 + semver 依赖解析 |
+| 层        | 技术                                                                              |
+| -------- | ------------------------------------------------------------------------------- |
+| 桌面框架     | Electron 30                                                                     |
+| 构建工具     | electron-vite 2 + Vite 5                                                        |
+| 前端       | React 18 + TypeScript 5 + Ant Design 5 + TailwindCSS + Zustand + React Router 6 |
+| 主进程      | Node.js 20 + TypeScript                                                         |
+| 数据库      | SQLite 3 + better-sqlite3 + Kysely                                              |
+| 事件总线     | EventEmitter2（通配符 + 错误隔离）                                                       |
+| 定时任务     | node-cron + SQLite 持久化                                                          |
+| 工作队列     | 自研 SQLite 持久化队列 + worker\_threads 并发                                            |
+| CLI      | commander.js                                                                    |
+| HTTP API | hono + zod-openapi + Swagger UI + Bearer Token                                  |
+| 日志       | pino + rotating-file-stream                                                     |
+| 打包分发     | electron-builder（Windows NSIS + portable）                                       |
+| 插件沙箱     | node:vm + manifest.json 权限声明 + semver 依赖解析                                      |
 
 ## GitHub
 

@@ -1,0 +1,20 @@
+{
+  "id": "com.fmb.demo.app",
+  "name": "Demo Counter (App)",
+  "version": "0.1.0",
+  "type": "app",
+  "description": "App plugin with a +1/-1 Counter sub-page. Renderer calls main via HostUIApi; main bumps a kv counter and pings atomic-demo's demo.echo extension point (bidirectional comms).",
+  "permissions": [
+    "log:write",
+    "audit:write",
+    "kv:read",
+    "kv:write",
+    "workflows:execute",
+    "extensions:call"
+  ],
+  "dependencies": {
+    "com.fmb.demo.atomic": "^0.1.0"
+  },
+  "main": "main.js",
+  "renderer": "renderer/index.ts"
+}

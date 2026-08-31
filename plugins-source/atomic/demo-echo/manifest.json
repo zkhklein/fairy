@@ -1,0 +1,11 @@
+{
+  "id": "com.fmb.demo.atomic",
+  "name": "Demo Echo (Atomic)",
+  "version": "0.1.0",
+  "type": "atomic",
+  "description": "Minimal atomic plugin. echo() returns input; crashMe() throws (AC-14 fault injection). Registers demo.echo extension point so app-demo can ping it bidirectionally.",
+  "permissions": ["log:write", "audit:write"],
+  "dependencies": {},
+  "main": "main.js",
+  "extensionPoints": ["demo.echo::echo"]
+}

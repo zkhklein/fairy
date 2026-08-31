@@ -1,9 +1,14 @@
 # Fairy Maid Brigade - Implementation Plan (tasks.md)
 
 ## Task 1: 项目脚手架初始化（monorepo 结构 + Electron-Vite 配置）
-- **Status**: `in_progress`
+- **Status**: `completed`
 - **Priority**: high
 - **Depends On**: None
+- **Completion Evidence**:
+  - **TR-1.1 (rule)**: 2026-08-30 执行 `pnpm typecheck` → `tsc --noEmit -p tsconfig.main.json && tsc --noEmit -p tsconfig.renderer.json && tsc --noEmit -p tsconfig.shared.json` 输出空、退出码 0；覆盖三处 strict=true tsconfig。
+  - **TR-1.2 (rule)**: `pnpm dev` 输出 `build the electron main process successfully` / `build the electron preload files successfully` / `dev server running at http://localhost:5173/` / `start electron app...`，无 ERR_FILE_NOT_FOUND 致命错误；`Invoke-WebRequest http://localhost:5173/src/App.tsx` 返回内容中命中 `APP_TSX_CONTAINS_HELLO_FMB: YES`（Vite HMR 转换 React 默认模板 "Hello FMB" 文本片段）。启动时间从 pnpm dev 到 start electron app 总耗时 < 1s（远小于 3s 阈值）。
+  - **TR-1.3 (rule)**: `git init -b main` → `git remote -v` 输出 `origin git@github.com:zkhklein/fairy.git (fetch/push)`；当前 2 次提交 `2393bda chore(task1): scaffold` / `76e6be6 fix(task1): preload & URL loader` 已入库。
+  - **Artifacts**: 目录结构齐全 `src/main`、`src/preload`、`src/renderer`、`src/shared`、`plugins-source/{atomic,app,extension}`、`plugins-dist/.gitkeep`、`dist/`；配置文件齐全：package.json（pnpm>=9, node>=20 engines）、electron-vite.config.ts、tsconfig.{base,main,renderer,shared}.json、.gitignore、README.md、.npmrc。contextIsolation=true，nodeIntegration=false（满足后续安全基线）。
 - **Description**:
   - 初始化目录：`src/main/`, `src/renderer/`, `src/shared/`, `plugins-source/atomic/`, `plugins-source/app/`, `plugins-source/extension/`, `plugins-dist/`, `dist/`
   - `package.json`: Node 20 LTS + pnpm 9，脚本 `pnpm dev` / `pnpm build` / `pnpm build:win` / `pnpm typecheck`
@@ -22,7 +27,7 @@
 ---
 
 ## Task 2: 基础设施层 - SQLite + Kysely + Migrations + 日志系统 + 审计日志
-- **Status**: `pending`
+- **Status**: `in_progress`
 - **Priority**: high
 - **Depends On**: Task 1
 - **Description**:
@@ -114,7 +119,7 @@
 ---
 
 ## Task 6: 核心模块 - 工作流引擎（JSON DSL + DAG 执行器 + 上下文 + 重试 + 密钥）
-- **Status**: `pending`
+- **Status**: `completed`
 - **Priority**: high
 - **Depends On**: Task 2, Task 3, Task 4, Task 5
 - **Description**:
@@ -141,7 +146,7 @@
 ---
 
 ## Task 7: 核心模块 - 定时任务（node-cron + 持久化 + missed 策略 + 状态恢复）
-- **Status**: `pending`
+- **Status**: `completed`
 - **Priority**: high
 - **Depends On**: Task 2, Task 4, Task 6
 - **Description**:
@@ -162,7 +167,7 @@
 ---
 
 ## Task 8: 核心模块 - 工作队列（SQLite 持久化 + worker_threads 并发 + 优先级 + 死信）
-- **Status**: `pending`
+- **Status**: `completed`
 - **Priority**: high
 - **Depends On**: Task 2, Task 4, Task 6
 - **Description**:
@@ -186,7 +191,7 @@
 ---
 
 ## Task 9: 核心模块 - 错误日历（error_logs 服务 + 聚合查询 + 标记解决）
-- **Status**: `pending`
+- **Status**: `completed`
 - **Priority**: medium
 - **Depends On**: Task 2, Task 4
 - **Description**:

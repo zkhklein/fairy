@@ -1,0 +1,93 @@
+# ============================================================================
+# Fairy Maid Brigade — electron-builder 配置
+#
+# Windows 目标：x64 NSIS 安装包 + Portable 单文件
+#   - NSIS: oneClick=false 允许自定义安装目录、开始菜单/桌面快捷方式、卸载
+#   - Portable: 免安装 exe，双击即跑（用户数据仍入 %APPDATA%）
+# 跨平台设计：mac / linux 目标预留空壳（target 未启用，仅保证配置 schema 兼容）
+#
+# Demo 插件 zip（plugins-dist/*.zip）走 extraResources，随安装包分发：
+# 安装后位于 process.resourcesPath/plugins-dist/，UI/CLI 可直接发现安装。
+# ============================================================================
+
+appId: com.fairymaidbrigade.app
+productName: Fairy Maid Brigade
+copyright: Copyright © 2026 Fairy Maid Brigade
+
+# --- Node / 文件基础 ---
+# nodeGypRebuild 不设：本项目根无 binding.gyp，electron-builder 会自动按依赖表
+# 对 node_modules 里的原生模块（better-sqlite3 等）做 ABI 重编译。
+electronDownload:
+  mirror: https://npmmirror.com/mirrors/electron/
+
+directories:
+  buildResources: build-resources
+  output: dist2/
+
+artifactName: "${productName} ${version} ${arch}.${ext}"
+
+# --- 图标（T18-4 make-icons.mjs 生成到 build-resources/）---
+win:
+  icon: build-resources/icon.ico
+  artifactName: "${productName} ${version} ${arch}.${ext}"
+  target:
+    - target: nsis
+      arch: [x64]
+    - target: portable
+      arch: [x64]
+
+# --- NSIS 安装器 ---
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  perMachine: false
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  menuCategory: "Fairy Maid Brigade"
+  shortcutName: "Fairy Maid Brigade"
+  deleteAppDataOnUninstall: false
+  allowElevation: true
+  installerIcon: build-resources/icon.ico
+  uninstallerIcon: build-resources/icon.ico
+  installerHeaderIcon: build-resources/icon.ico
+
+# --- Portable ---
+portable:
+  artifactName: "${productName} ${version} ${arch} Portable.${ext}"
+  requestExecutionLevel: user
+
+# --- 包含的文件 / 排除的文件 ---
+# 主进程 out/main，预加载 out/preload，渲染层 out/renderer，CLI out/cli
+# electron-builder 会自动把 node_modules 里实际 require 到的包打进 app.asar。
+# 显式声明 files 是 belt-and-suspenders：保证 4 份构建产物全部到位。
+files:
+  - "out/main/**/*"
+  - "out/preload/**/*"
+  - "out/renderer/**/*"
+  - "out/cli/**/*"
+  - "build/main-app/**/*"
+  - "package.json"
+  - from: "."
+    filter:
+      - "node_modules/**/*"
+      - "!node_modules/**/{test,tests,__tests__,spec,example,examples,docs,coverage,*.md,*.ts,*.map,.github}"
+
+# --- 3 个 Demo 插件 zip 随包 ---
+extraResources:
+  - from: plugins-dist
+    to: plugins-dist
+    filter:
+      - "*.zip"
+
+# --- asar 解包（native / CJS / 动态 require 必需）---
+asarUnpack:
+  - node_modules/better-sqlite3/**/*
+  - node_modules/pino/**/*
+  - node_modules/pino-pretty/**/*
+  - node_modules/rotating-file-stream/**/*
+  - node_modules/electron-log/**/*
+
+# --- 发布（预留）---
+publish:
+  provider: generic
+  url: "https://example.invalid/fmb/releases"

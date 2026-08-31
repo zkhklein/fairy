@@ -1,79 +1,68 @@
-import { app, BrowserWindow } from 'electron';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+/**
+ * Electron-vite DEFAULT main entry: bootstrap stub.
+ *
+ * electron-vite 2.x hardcodes its SSR entry convention to src/main/index.ts
+ * and fully ignores rollupOptions.input overrides we tried. So THIS file IS
+ * the electron-vite main entry → compiled to out/main/index.js (CommonJS).
+ *
+ * It then delegates to the REAL main process code emitted by esbuild into
+ * build/main-app/index.mjs (ES Module). Using dynamic import() from CJS
+ * context works in Node 20 and resolves the critical "require() of ES
+ * Module" incompatibility (Kysely, nanoid, pino ship ESM only; CJS cannot
+ * require them but ESM can import both CJS native bindings + other ESM).
+ *
+ * This stub is deliberately written using only Node built-ins so electron-vite
+ * can inline it without pulling in any other source files or deps.
+ */
+const fs = require('fs');
+const path = require('path');
+const { pathToFileURL } = require('url');
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-
-// eslint-disable-next-line node/prefer-global/process
-process.env['ELECTRON_DISABLE_SECURITY_WARNINGS'] = 'true';
-
-const FALLBACK_DEV_SERVER_URL = 'http://localhost:5173';
-
-let mainWindow: BrowserWindow | null = null;
-
-function resolveRendererEntry(): { mode: 'url'; url: string } | { mode: 'file'; file: string } {
-  if (!app.isPackaged) {
-    // eslint-disable-next-line node/prefer-global/process
-    const fromEnv = process.env['VITE_DEV_SERVER_URL'] || process.env.VITE_DEV_SERVER_URL;
-    const url = (typeof fromEnv === 'string' && fromEnv.length > 0) ? fromEnv : FALLBACK_DEV_SERVER_URL;
-    return { mode: 'url', url };
-  }
-  return { mode: 'file', file: path.join(__dirname, '../renderer/index.html') };
+function projectRoot() {
+  // __dirname at SSR emit location = <project>/out/main/ → two levels up.
+  return path.resolve(__dirname, '..', '..');
 }
 
-function createWindow(): void {
-  mainWindow = new BrowserWindow({
-    title: 'Fairy Maid Brigade',
-    width: 1280,
-    height: 800,
-    minWidth: 960,
-    minHeight: 640,
-    show: false,
-    autoHideMenuBar: true,
-    webPreferences: {
-      contextIsolation: true,
-      nodeIntegration: false,
-      sandbox: false,
-      preload: path.join(__dirname, '../preload/index.js'),
-    },
-  });
+const realMain = path.join(projectRoot(), 'build', 'main-app', 'index.mjs');
 
-  mainWindow.once('ready-to-show', () => {
-    mainWindow?.show();
-  });
-
-  const entry = resolveRendererEntry();
-  if (entry.mode === 'url') {
-    const load = async (): Promise<void> => {
-      try {
-        await mainWindow?.loadURL(entry.url);
-      } catch (err) {
-        // Retry once against fallback URL if VITE_DEV_SERVER_URL was stale
-        if (entry.url !== FALLBACK_DEV_SERVER_URL) {
-          await mainWindow?.loadURL(FALLBACK_DEV_SERVER_URL);
-          return;
-        }
-        throw err;
-      }
-    };
-    void load();
-  } else {
-    void mainWindow.loadFile(entry.file);
-  }
+if (!fs.existsSync(realMain)) {
+  // eslint-disable-next-line no-console
+  console.error('[FMB:bootstrap] esbuild main bundle MISSING: ' + realMain);
+  // eslint-disable-next-line no-process-exit
+  process.exit(1);
 }
 
-app.whenReady().then(() => {
-  createWindow();
+// Node's ESM loader on Windows requires file:// URLs for absolute paths.
+const realMainUrl = pathToFileURL(realMain).toString();
 
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) {
-      createWindow();
-    }
+// Bridge the race between end-of-script and async import() resolution:
+// without active handles, Node/Electron would terminate before realMain
+// finishes loading and installs its long-lived handles (BrowserWindow,
+// ipcMain listeners, logger streams, etc). The real main bundle clears
+// this keepalive via globalThis.__fmbClearKeepalive once it has booted.
+let keepalive: ReturnType<typeof setInterval> | null = null;
+if (typeof setInterval !== 'undefined') {
+  keepalive = setInterval(() => {}, 30_000);
+}
+function stopKeepalive() {
+  try {
+    if (keepalive != null) clearInterval(keepalive);
+  } catch { /* noop */ }
+  keepalive = null;
+}
+// Also expose for the real main bundle (optional proactive cleanup).
+(globalThis as any).__fmbClearKeepalive = stopKeepalive;
+
+import(/* webpackIgnore: true */ realMainUrl)
+  .then(() => {
+    // Real main bundle will keep the event loop alive via its own handles
+    // (BrowserWindow, ipc, file streams). Release our hold within ~1s:
+    setTimeout(stopKeepalive, 1000).unref?.();
+  })
+  .catch((err) => {
+    stopKeepalive();
+    // eslint-disable-next-line no-console
+    console.error('[FMB:bootstrap] failed to load real main bundle', err && err.stack ? err.stack : err);
+    // eslint-disable-next-line no-process-exit
+    process.exit(1);
   });
-});
-
-app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') {
-    app.quit();
-  }
-});

@@ -1,0 +1,11 @@
+{
+  "id": "com.fmb.demo.extension",
+  "name": "Demo Install Notify (Extension)",
+  "version": "0.1.0",
+  "type": "extension",
+  "description": "Extension plugin. Subscribes to plugin.afterInstall; on every new plugin install it writes a warn-level log + a kv record carrying a fresh traceId (TR-16.3 evidence).",
+  "permissions": ["log:write", "kv:write", "audit:write", "event:subscribe"],
+  "dependencies": {},
+  "main": "main.js",
+  "extensionPoints": ["plugin.afterInstall::onAfterInstall"]
+}

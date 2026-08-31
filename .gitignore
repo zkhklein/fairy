@@ -61,3 +61,25 @@ coverage/
 
 # Spec Mode artifacts (ignored by git but retained locally)
 # .trae/specs/ should be committed (spec mode artifacts)
+
+# Dev-only local data (sqlite DB + logs + uncompressed plugin staging)
+.data/
+.sqlite/
+wal/
+*.sqlite-shm
+*.sqlite-wal
+fmb.db*
+
+# Intermediate build artifacts from esbuild (main process CJS + sourcemaps)
+build/
+bootstrap/
+electron-vite-build.log
+boot-markers.log
+scripts/verify_task2.cjs
+
+# electron-builder output (NSIS + portable + win-unpacked) — moved off dist/ to
+# bypass app.asar lock during iterative repackaging. Never commit installers.
+dist2/
+
+# pnpm/npm download cache
+.npm-cache/

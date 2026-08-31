@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#6366F1"/>
+      <stop offset="100%" stop-color="#A855F7"/>
+    </linearGradient>
+  </defs>
+  <rect x="0" y="0" width="1024" height="1024" rx="216" fill="url(#g)"/>
+  <!-- Maid head silhouette (simple outline) -->
+  <circle cx="512" cy="410" r="160" fill="#FFFFFF"/>
+  <path d="M 310 560 Q 512 780 714 560 L 780 900 L 244 900 Z" fill="#FFFFFF" opacity="0.97"/>
+  <!-- Apron highlight -->
+  <path d="M 430 720 L 430 900 L 594 900 L 594 720 Q 512 760 430 720 Z" fill="#FDE68A"/>
+  <!-- Brand letters bottom -->
+  <text x="512" y="960" text-anchor="middle" font-family="'Segoe UI', sans-serif"
+        font-size="112" font-weight="800" fill="#FFFFFF" letter-spacing="12">FMB</text>
+</svg>
