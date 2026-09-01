@@ -107,6 +107,9 @@ export const WorkflowSchema = z.object({
   description: z.string().default(''),
   definition_json: zJsonText,
   vars_json: zJsonText,
+  // App plugin that owns and created this workflow.
+  // NOT NULL in DB; populated at creation from HostAPI callers.
+  owner_plugin_id: z.string().min(2),
   created_at: zUnixMs,
   updated_at: zUnixMs,
 });
@@ -270,6 +273,13 @@ export type PluginViewModel = z.infer<typeof PluginViewModelSchema>;
 export const WorkflowViewModelSchema = WorkflowSchema.extend({
   definition: z.record(z.string(), z.unknown()),
   vars: z.record(z.string(), z.unknown()),
+  // UI enrichment: owner plugin metadata (joined at the API boundary).
+  owner_name: z.string().optional(),
+  owner_type: z.enum(['atomic', 'app', 'extension']).optional(),
+  // Referenced atomic plugin ids scanned from definition.nodes[].pluginId.
+  referenced_plugin_ids: z.array(z.string()).default([]),
+  // Node summary: { total, atomic, control }
+  node_counts: z.object({ total: z.number().int().nonnegative(), atomic: z.number().int().nonnegative(), control: z.number().int().nonnegative() }).optional(),
 });
 export type WorkflowViewModel = z.infer<typeof WorkflowViewModelSchema>;
 

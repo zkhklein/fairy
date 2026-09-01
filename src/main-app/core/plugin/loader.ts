@@ -22,6 +22,7 @@ import { getRawDb } from '../db';
 
 import type { PluginManifest, PluginType, ProblemDetails, HostApi } from '@shared/index';
 import { PluginManifestSchema, toProblemDetails } from '@shared/index';
+import { FMB_BUILTIN_HOST_PLUGIN_ID, FMB_BUILTIN_HOST_PLUGIN_NAME } from '@shared/project';
 import { readManifestFromDir } from './manifest';
 import { createSandbox, PermissionDeniedError, createPermissionedHostApi } from './sandbox';
 import { buildHostApi, type HostApiServices } from './host-api';
@@ -62,21 +63,175 @@ export class PluginService {
   private readonly pluginsRoot: string;
   private readonly bus: EventBusService;
   private readonly loadedInstances = new Map<string, PluginInstance>();
+  // Wire WorkflowService callbacks once they become available post-boot, so
+  // app plugins can use host.workflows.create() without cyclic imports.
+  private workflowCallbacks: {
+    create?: HostApiServices['onCreateWorkflow'];
+    start?: HostApiServices['onStartWorkflow'];
+    get?: HostApiServices['onGetWorkflow'];
+  } = {};
+
+  setWorkflowCallbacks(cb: {
+    create?: HostApiServices['onCreateWorkflow'];
+    start?: HostApiServices['onStartWorkflow'];
+    get?: HostApiServices['onGetWorkflow'];
+  }): void {
+    this.workflowCallbacks = { ...this.workflowCallbacks, ...cb };
+  }
 
   constructor(opts?: { pluginsRoot?: string; eventBus?: EventBusService }) {
     this.bus = opts?.eventBus ?? getEventBus();
     try {
-      if (electronApp?.isPackaged) {
-        this.pluginsRoot = path.join(electronApp.getPath('userData'), 'plugins');
-      } else if (opts?.pluginsRoot) {
+      if (opts?.pluginsRoot) {
         this.pluginsRoot = opts.pluginsRoot;
       } else {
-        this.pluginsRoot = path.join(electronApp.getAppPath(), '.data', 'plugins');
+        // --- Marker-first: resolve the portable root directly from the marker
+        // file, placed there by applyPortablePathsAndMigrate(). Works even if
+        // ESM hoisting delayed the bootstrap past app.isReady() so
+        // electronApp.setPath didn't reroute userData.
+        let portableRoot: string | undefined;
+        try {
+          const portableDir = 'fmb-data';
+          const markerName = '.fmb-portable-root';
+          const candidateMarkers: string[] = [];
+          try {
+            candidateMarkers.push(path.join(path.dirname(electronApp.getPath('exe')), portableDir, markerName));
+          } catch { /* noop */ }
+          candidateMarkers.push(path.join(process.cwd(), '.data', markerName));
+          for (const mp of candidateMarkers) {
+            if (fs.existsSync(mp)) {
+              const m = JSON.parse(fs.readFileSync(mp, 'utf8')) as { portableRoot?: string };
+              if (m.portableRoot) { portableRoot = m.portableRoot; break; }
+            }
+          }
+        } catch { /* noop */ }
+        if (portableRoot) {
+          this.pluginsRoot = path.join(portableRoot, 'plugins');
+        } else {
+          // Portable mode fallback: runtime-paths redirects setPath('userData'),
+          // but the plugin directory is intentionally a sibling called `plugins`
+          // under the portable root (cleaner layout than nesting inside userData).
+          // We derive the portable root by going up once from userData if it
+          // ends with /userData.
+          const userData = electronApp.getPath('userData');
+          const inferredRoot = userData.endsWith(path.sep + 'userData')
+            ? path.dirname(userData)
+            : userData;
+          this.pluginsRoot = path.join(inferredRoot, 'plugins');
+        }
       }
     } catch {
       this.pluginsRoot = opts?.pluginsRoot ?? path.resolve(process.cwd(), '.data', 'plugins');
     }
     fs.mkdirSync(this.pluginsRoot, { recursive: true });
+    this.ensureBuiltinHostPlugin();
+  }
+
+  /**
+   * com.fmb.host is a virtual built-in app plugin used as the default owner
+   * for workflows that pre-date the mandatory owner_plugin_id FK (migration
+   * 002). The migration inserts a row into `plugins` but does NOT write the
+   * corresponding `plugin_versions` row nor the on-disk plugin directory, so
+   * `enablePlugin()` would otherwise fail with "not on disk".
+   *
+   * This method is idempotent: it UPSERTs the plugins row, INSERT OR IGNOREs
+   * the plugin_versions row, and (re)writes manifest.json + index.js on
+   * disk so subsequent enable() calls find a real, loadable plugin.
+   */
+  private ensureBuiltinHostPlugin(): void {
+    const version = '0.1.0';
+    const pluginId = FMB_BUILTIN_HOST_PLUGIN_ID;
+    const targetDir = path.join(this.pluginsRoot, `${pluginId}@${version}`);
+    const manifest: PluginManifest = {
+      id: pluginId,
+      name: FMB_BUILTIN_HOST_PLUGIN_NAME,
+      version,
+      type: 'app',
+      description:
+        'Built-in owner plugin for legacy workflows and host-side bootstrapping. No-op activate, no renderer sub-page.',
+      permissions: [],
+      dependencies: {},
+      main: 'index.js',
+      extensionPoints: [],
+    };
+
+    try {
+      // 1) On-disk artifacts (idempotent: overwrite each boot so stale
+      // manifests don't drift).
+      fs.mkdirSync(targetDir, { recursive: true });
+      fs.writeFileSync(path.join(targetDir, 'manifest.json'), JSON.stringify(manifest, null, 2));
+      if (!fs.existsSync(path.join(targetDir, manifest.main))) {
+        fs.writeFileSync(
+          path.join(targetDir, manifest.main),
+          [
+            '// Built-in virtual owner plugin for legacy workflows (auto-generated).',
+            '// This plugin is intentionally minimal: no activate side-effects, no renderer.',
+            'module.exports = {',
+            '  activate() {},',
+            '  deactivate() {},',
+            '};',
+            '',
+          ].join('\n'),
+        );
+      }
+
+      const now = Date.now();
+      const permissionsJson = JSON.stringify(manifest.permissions ?? []);
+      const depsJson = JSON.stringify(manifest.dependencies ?? {});
+      const manifestJson = JSON.stringify(manifest);
+
+      // 2) UPSERT plugins table row (keeps installed_at if already present).
+      const existing = this.get(pluginId);
+      if (!existing) {
+        this.raw()
+          .prepare(
+            `INSERT INTO plugins (id,name,type,description,current_version,status,permissions_json,dependencies_json,manifest_json,installed_at,updated_at)
+             VALUES (@id,@name,@type,@desc,@version,'installed',@perm,@deps,@man,@t,@t)`,
+          )
+          .run({
+            id: pluginId,
+            name: manifest.name,
+            type: manifest.type,
+            desc: manifest.description ?? '',
+            version,
+            perm: permissionsJson,
+            deps: depsJson,
+            man: manifestJson,
+            t: now,
+          });
+      } else {
+        this.raw()
+          .prepare(
+            `UPDATE plugins SET name=@name, type=@type, description=@desc, current_version=@version,
+                    permissions_json=@perm, dependencies_json=@deps, manifest_json=@man, updated_at=@t
+              WHERE id=@id`,
+          )
+          .run({
+            id: pluginId,
+            name: manifest.name,
+            type: manifest.type,
+            desc: manifest.description ?? '',
+            version,
+            perm: permissionsJson,
+            deps: depsJson,
+            man: manifestJson,
+            t: now,
+          });
+      }
+
+      // 3) plugin_versions INSERT OR IGNORE (primary key = plugin_id+version).
+      try {
+        this.raw()
+          .prepare(
+            `INSERT OR IGNORE INTO plugin_versions (plugin_id,version,directory,installed_at) VALUES (?,?,?,?)`,
+          )
+          .run(pluginId, version, targetDir, existing?.installed_at ?? now);
+      } catch (e: any) {
+        if (!String(e?.message ?? '').includes('UNIQUE')) throw e;
+      }
+    } catch (e: any) {
+      log.error({ err: String(e?.stack ?? e) }, `ensureBuiltinHostPlugin(${pluginId}) failed — enable will be unavailable`);
+    }
   }
 
   get root(): string { return this.pluginsRoot; }
@@ -286,6 +441,9 @@ export class PluginService {
       eventBus: this.bus,
       pluginService: this,
       selfManifest: manifest,
+      onCreateWorkflow: (a) => this.workflowCallbacks.create?.(a) ?? {},
+      onStartWorkflow: (id, input) => Promise.resolve(this.workflowCallbacks.start?.(id, input) ?? { runId: '', status: 'pending' }),
+      onGetWorkflow: (id) => this.workflowCallbacks.get?.(id) ?? null,
       onAudit: (a) => {
         try {
           // audit_logs.source CHECK IN ('ui','cli','http','system','plugin'); use just 'plugin'

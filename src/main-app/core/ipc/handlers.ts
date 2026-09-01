@@ -109,6 +109,46 @@ export function registerIpcHandlers(ctx: IpcRegistry): () => void {
   }
 
   // ---- Plugins ----
+  /**
+   * Serialize a plugin Result.error (a ProblemDetails object) into an Error
+   * whose `message` is fully human-readable + `issues` array contains the
+   * structured path-errors. IPC handlers' catch() block then converts this
+   * to plain {message,code,issues} so the renderer sees real context instead
+   * of the opaque "[object Object]" default toString().
+   */
+  function pluginError(err: any, code: string): Error & { code: string; issues: unknown } {
+    const title: string = err?.title ?? `${code} failed`;
+    const status: number | undefined = err?.status ? Number(err.status) : undefined;
+    const detail: string | undefined = err?.detail ? String(err.detail) : undefined;
+    const rawErrors: Array<{ path?: (string | number)[]; message?: string; code?: string }> =
+      Array.isArray(err?.errors) ? (err.errors as any[]) : [];
+    const issues = rawErrors.map(e => ({
+      path: Array.isArray(e.path) ? e.path.map(String) : undefined,
+      message: e.message ? String(e.message) : undefined,
+      code: e.code ? String(e.code) : undefined,
+    }));
+    const parts: string[] = [title];
+    if (status != null) parts.push(`[HTTP ${status}]`);
+    if (detail) parts.push(detail);
+    if (issues.length) {
+      parts.push(
+        issues
+          .map(issue => {
+            const loc = issue.path?.length ? ` (${issue.path.join('/')})` : '';
+            const c = issue.code ? `[${issue.code}]` : '';
+            return `•${c}${loc} ${issue.message ?? ''}`.trim();
+          })
+          .join('; '),
+      );
+    }
+    const msg = parts.join(' — ');
+    const e = new Error(msg) as Error & { code: string; issues: unknown };
+    e.code = code;
+    e.issues = issues.length ? issues : null;
+    // log.warn so operators can backtrack failures without UI details.
+    log.warn({ code, status: status ?? null, title, detail, issues }, 'plugin op failed');
+    return e;
+  }
   wire(main_plugin_list, (p) => pluginSvc.list(p));
   wire(main_plugin_get, (p) => {
     const raw = pluginSvc.get(p.id);
@@ -123,24 +163,22 @@ export function registerIpcHandlers(ctx: IpcRegistry): () => void {
   });
   wire(main_plugin_install, async (p) => {
     const r = await pluginSvc.installFromZip(p.zipPath);
-    if (!r.ok) {
-      throw Object.assign(new Error(r.error?.title ?? 'Install failed'), { code: 'INSTALL_FAILED', issues: r.error?.errors ?? null });
-    }
+    if (!r.ok) throw pluginError(r.error, 'INSTALL_FAILED');
     return pluginSvc.get((r as { pluginId: string }).pluginId);
   });
   wire(main_plugin_setStatus, async (p) => {
     if (p.status === 'enabled') {
       const r = await pluginSvc.enablePlugin(p.id);
-      if (!r.ok) throw Object.assign(new Error(r.error?.title ?? 'Enable failed'), { code: 'ENABLE_FAILED' });
+      if (!r.ok) throw pluginError(r.error, 'ENABLE_FAILED');
     } else if (p.status === 'disabled') {
       const r = await pluginSvc.disablePlugin(p.id);
-      if (!r.ok) throw Object.assign(new Error(r.error?.title ?? 'Disable failed'), { code: 'DISABLE_FAILED' });
+      if (!r.ok) throw pluginError(r.error, 'DISABLE_FAILED');
     }
     return pluginSvc.get(p.id);
   });
   wire(main_plugin_uninstall, async (p) => {
     const r = await pluginSvc.uninstallPlugin(p.id);
-    if (!r.ok) throw Object.assign(new Error(r.error?.title ?? 'Uninstall failed'), { code: 'UNINSTALL_FAILED' });
+    if (!r.ok) throw pluginError(r.error, 'UNINSTALL_FAILED');
     return { ok: true as const };
   });
   wire(main_plugin_validateManifest, (p) => {
@@ -157,7 +195,7 @@ export function registerIpcHandlers(ctx: IpcRegistry): () => void {
   wire(main_plugin_listVersions, (p) => ({ items: pluginSvc.listVersions(p.id) }));
   wire(main_plugin_switchVersion, async (p) => {
     const r = await pluginSvc.switchVersion(p.id, p.version);
-    if (!r.ok) throw Object.assign(new Error(r.error?.title ?? '版本切换失败'), { code: 'SWITCH_VERSION_FAILED', issues: r.error?.errors ?? null });
+    if (!r.ok) throw pluginError(r.error, 'SWITCH_VERSION_FAILED');
     return pluginSvc.get(p.id);
   });
 
@@ -173,17 +211,18 @@ export function registerIpcHandlers(ctx: IpcRegistry): () => void {
   // ---- Workflows ----
   wire(main_workflow_list, (p) => workflow.list(p));
   wire(main_workflow_get, (p) => workflow.getViewModel(p.id));
-  wire(main_workflow_create, (p) => {
-    // Translate IPC aliases → WorkflowService.create args
-    const definition = (p.definition_json ?? p.definition ?? {}) as any;
-    const vars = (p.vars_json ? JSON.parse(p.vars_json) : (p.vars ?? {})) as Record<string, unknown>;
-    return workflow.create({
-      id: p.id,
-      name: p.name,
-      description: p.description,
-      definition,
-      vars,
-    });
+  wire(main_workflow_create, () => {
+    // UI/CLI direct creation is disallowed after the owner-ownership contract
+    // (v3): workflows must be created exclusively from an app plugin's HostAPI
+    // so `owner_plugin_id` can be trusted to match the plugin's own identity.
+    // The channel is intentionally kept alive so older renderers don't throw
+    // `no handler registered`, but it always returns a 403-shaped error.
+    const err: Error & { code?: string; status?: number } = new Error(
+      '创建工作流仅允许从 app 插件 HostAPI 发起（工作流归应用插件所有）。请从对应应用插件的子页面内创建。',
+    );
+    err.code = 'CREATION_DISALLOWED';
+    err.status = 403;
+    throw err;
   });
   wire(main_workflow_update, (p) => {
     // Translate IPC aliases → WorkflowService.update patch
@@ -364,8 +403,8 @@ export function registerIpcHandlers(ctx: IpcRegistry): () => void {
     'queue.jobCompleted': '作业成功完成后触发。',
     'queue.jobFailed':    '作业耗尽所有重试 / 被标记 dead 后触发。',
     // ===== Error & audit =====
-    'error.captured':   '错误日历新增一条错误时触发（alias：errorLog.newEntry）。',
-    'errorLog.newEntry': '错误日历新增一条错误时触发，可用于通知。',
+    'error.captured':   '错误日志新增一条错误时触发（alias：errorLog.newEntry）。',
+    'errorLog.newEntry': '错误日志新增一条错误时触发，可用于通知。',
     'audit.newEntry':    'audit_logs 新增一条记录时触发。',
     // ===== UI =====
     'ui.mainMenu.render':      '主界面左侧菜单生成前，可用于注入插件子菜单项。',

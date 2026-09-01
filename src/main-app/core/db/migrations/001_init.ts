@@ -172,4 +172,63 @@ CREATE TABLE IF NOT EXISTS kv_store (
 /** Ordered, append-only registry. NEVER REORDER existing entries. */
 export const MIGRATIONS: Migration[] = [
   { name: '001_init.sql', up: _001_init },
+  {
+    name: '002_workflows_owner_plugin_id.sql',
+    up: /* sql */ `
+-- Step 1: Add nullable column with a sentinel default. (SQLite ALTER TABLE
+-- only supports single-column additions, so we perform the upgrade in three
+-- separate statements executed as a script.)
+ALTER TABLE workflows ADD COLUMN owner_plugin_id TEXT NOT NULL DEFAULT '__PENDING_MIGRATE__';
+
+-- Step 2: Ensure a builtin "host" app plugin exists. Any legacy workflows
+-- that existed before this migration get assigned to the host plugin.
+INSERT OR IGNORE INTO plugins (id, name, type, description, current_version, status, permissions_json, dependencies_json, manifest_json, installed_at, updated_at)
+VALUES (
+  'com.fmb.host',
+  '内置宿主插件',
+  'app',
+  'Built-in owner plugin for legacy workflows and host-side bootstrapping.',
+  '0.1.0',
+  'installed',
+  '[]',
+  '{}',
+  '{"id":"com.fmb.host","name":"内置宿主插件","version":"0.1.0","type":"app","description":"Built-in owner plugin.","permissions":[],"dependencies":{},"main":"index.js","extensionPoints":[]}',
+  CAST((julianday('now') - 2440587.5)*86400000 AS INTEGER),
+  CAST((julianday('now') - 2440587.5)*86400000 AS INTEGER)
+);
+
+-- Step 3: Backfill all __PENDING_MIGRATE__ rows to either the earliest
+-- installed app plugin or, if none exists, the builtin host plugin.
+UPDATE workflows
+SET owner_plugin_id = COALESCE(
+  (SELECT id FROM plugins WHERE type = 'app' ORDER BY installed_at ASC, id ASC LIMIT 1),
+  'com.fmb.host'
+)
+WHERE owner_plugin_id = '__PENDING_MIGRATE__';
+
+-- Step 4: SQLite can't enforce FK constraints via ALTER ADD COLUMN, so we
+-- use triggers to guarantee owner_plugin_id always points to an app plugin.
+DROP TRIGGER IF EXISTS trg_workflows_owner_app_insert;
+DROP TRIGGER IF EXISTS trg_workflows_owner_app_update;
+CREATE TRIGGER trg_workflows_owner_app_insert
+BEFORE INSERT ON workflows
+FOR EACH ROW WHEN (
+  COALESCE((SELECT type FROM plugins WHERE id = NEW.owner_plugin_id), '') != 'app'
+)
+BEGIN
+  SELECT RAISE(ABORT, 'owner_plugin_id must reference a plugin with type=app');
+END;
+CREATE TRIGGER trg_workflows_owner_app_update
+BEFORE UPDATE OF owner_plugin_id, id ON workflows
+FOR EACH ROW WHEN (
+  COALESCE((SELECT type FROM plugins WHERE id = NEW.owner_plugin_id), '') != 'app'
+)
+BEGIN
+  SELECT RAISE(ABORT, 'owner_plugin_id must reference a plugin with type=app');
+END;
+
+-- Step 5: Index for owner-based listing.
+CREATE INDEX IF NOT EXISTS idx_workflows_owner ON workflows(owner_plugin_id);
+`,
+  },
 ];

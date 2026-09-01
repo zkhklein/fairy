@@ -54,16 +54,48 @@ let kyselyInstance: Kysely<FMBTables> | null = null;
 let initialized = false;
 
 function resolveDbPath(): string {
-  if (app.isPackaged) {
-    const userData = app.getPath('userData');
-    fs.mkdirSync(userData, { recursive: true });
-    return path.join(userData, 'fmb.db');
+  // Marker-first resolution: even when app.setPath('userData') couldn't be
+  // applied (because app was ready when the bootstrap ran), we still honour
+  // the portable root stored in the marker file. Falls back to
+  // app.getPath('userData') when no marker exists (legacy / dev without
+  // runtime-paths boot).
+  let userData: string | undefined;
+  try {
+    const markerPath = resolvePortableMarkerPath();
+    if (markerPath && fs.existsSync(markerPath)) {
+      const marker = JSON.parse(fs.readFileSync(markerPath, 'utf8')) as { portableRoot?: string };
+      if (marker.portableRoot) {
+        userData = path.join(marker.portableRoot, 'userData');
+      }
+    }
+  } catch { /* ignore, fall back to app.getPath */ }
+  if (!userData) userData = app.getPath('userData');
+  fs.mkdirSync(userData, { recursive: true });
+  return path.join(userData, 'fmb.db');
+}
+
+/**
+ * Try to locate the portable marker file by checking known candidate
+ * locations (next to the packaged exe; next to project root for dev).
+ * Kept in sync with FMB_PORTABLE_{DIR,MARKER} in src/shared/project.ts.
+ * Does NOT import from runtime-paths to avoid ESM/CJS + bundle edge cases.
+ */
+function resolvePortableMarkerPath(): string | null {
+  const portableDir = 'fmb-data';
+  const markerName = '.fmb-portable-root';
+  const candidates: string[] = [];
+  try {
+    // Packaged: next to electron exe
+    candidates.push(path.join(path.dirname(app.getPath('exe')), portableDir, markerName));
+  } catch { /* noop */ }
+  try {
+    // Dev (cwd-based)
+    candidates.push(path.join(process.cwd(), '.data', markerName));
+  } catch { /* noop */ }
+  for (const c of candidates) {
+    try { if (fs.existsSync(c)) return c; } catch { /* noop */ }
   }
-  // In dev: app.getAppPath() returns the project root (where package.json lives)
-  const projectRoot = app.getAppPath();
-  const dir = path.join(projectRoot, '.data');
-  fs.mkdirSync(dir, { recursive: true });
-  return path.join(dir, 'fmb.db');
+  return null;
 }
 
 function runMigrations(db: Database.Database): string[] {

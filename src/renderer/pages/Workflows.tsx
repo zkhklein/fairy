@@ -3,38 +3,33 @@ import React from 'react';
 /**
  * Workflows page — list + create/delete/run actions.
  * Four states are delegated to PageShell.
+ *
+ * Columns:
+ *   - Owner plugin (enriched from DB join; NOT NULL per migration 002)
+ *   - Referenced atomic plugin IDs (scanned from DAG definition.nodes[].pluginId)
+ *   - Node summary (total / atomic / control-flow)
+ *
+ * Workflows can no longer be created from the UI directly (ownership contract
+ * v3). The "创建示例" button is kept as a disabled affordance with a tooltip
+ * explaining that workflows are owned exclusively by app-type plugins.
  */
-import { Button, Space, Table, Tag, message, Tooltip } from 'antd';
-import { ReloadOutlined, PlusOutlined, PlayCircleOutlined, DeleteOutlined } from '@ant-design/icons';
-import { useEffect } from 'react';
+import { Button, Space, Table, Tag, message, Tooltip, Empty } from 'antd';
+import { ReloadOutlined, PlusOutlined, PlayCircleOutlined, DeleteOutlined, AppstoreAddOutlined } from '@ant-design/icons';
+import { useEffect, useMemo } from 'react';
 import PageShell from '../components/PageShell';
 import { useWorkflowStore } from '../stores';
+import type { WorkflowViewModel } from '@shared/types';
 
 export default function Workflows(): JSX.Element {
-  const { loading, error, data, list, del, create, run } = useWorkflowStore();
+  const { loading, error, data, list, create, run, del } = useWorkflowStore();
 
   useEffect(() => { void list(); }, [list]);
 
   const onCreateSample = async (): Promise<void> => {
-    try {
-      const wf = await create({
-        name: `示例工作流 #${Date.now().toString(36)}`,
-        description: '由 UI 创建的示例 DAG：noop → noop',
-        definition: {
-          version: 1,
-          kind: 'dag',
-          nodes: [
-            { id: 'start', type: 'noop', config: {} },
-            { id: 'end', type: 'noop', config: {} },
-          ],
-          edges: [{ from: 'start', to: 'end' }],
-          variables: [],
-        },
-      });
-      message.success(`已创建：${wf.name}`);
-    } catch (e) {
-      message.error((e as { message?: string }).message ?? '创建失败');
-    }
+    // UI direct creation is forbidden (v3 ownership contract). Keep the
+    // clickable path so users still get explicit feedback instead of a
+    // silently disabled button.
+    message.warning('工作流归应用插件（app 类型）所有。请从对应应用插件的子页面内创建工作流。');
   };
 
   const onRun = async (id: string): Promise<void> => {
@@ -55,9 +50,49 @@ export default function Workflows(): JSX.Element {
     }
   };
 
-  const cols = [
+  const cols = useMemo(() => [
     { title: 'ID', dataIndex: 'id', key: 'id', width: 220 },
     { title: '名称', dataIndex: 'name', key: 'name' },
+    {
+      title: '所属应用插件',
+      key: 'owner',
+      width: 260,
+      render: (_v: unknown, row: WorkflowViewModel) => {
+        const name = row.owner_name ?? row.owner_plugin_id;
+        return (
+          <Space size={4}>
+            <Tag icon={<AppstoreAddOutlined />} color="geekblue">App</Tag>
+            <span style={{ fontWeight: 500 }}>{name}</span>
+            <span style={{ color: '#888', fontSize: 12 }}>{row.owner_plugin_id}</span>
+          </Space>
+        );
+      },
+    },
+    {
+      title: '引用原子插件',
+      key: 'refs',
+      width: 260,
+      render: (_v: unknown, row: WorkflowViewModel) => {
+        const ids = row.referenced_plugin_ids ?? [];
+        if (ids.length === 0) return <span style={{ color: '#bbb' }}>— 无 —</span>;
+        return (
+          <Space size={4} wrap>
+            {ids.map((pid) => (
+              <Tag key={pid} color="blue">{pid}</Tag>
+            ))}
+          </Space>
+        );
+      },
+    },
+    {
+      title: '节点概况',
+      key: 'nodes',
+      width: 180,
+      render: (_v: unknown, row: WorkflowViewModel) => {
+        const nc = row.node_counts ?? { total: 0, atomic: 0, control: 0 };
+        return `${nc.total} 节点 · ${nc.atomic} atomic · ${nc.control} 控制`;
+      },
+    },
     { title: '描述', dataIndex: 'description', key: 'desc', ellipsis: true },
     {
       title: '创建时间',
@@ -77,7 +112,7 @@ export default function Workflows(): JSX.Element {
       title: '操作',
       key: 'op',
       width: 200,
-      render: (_: unknown, row: { id: string; name: string }) => (
+      render: (_: unknown, row: WorkflowViewModel) => (
         <Space>
           <Tooltip title="立即运行一次">
             <Button size="small" type="link" icon={<PlayCircleOutlined />} onClick={() => void onRun(row.id)}>运行</Button>
@@ -86,20 +121,33 @@ export default function Workflows(): JSX.Element {
         </Space>
       ),
     },
-  ];
+  ], [onRun, onDelete]);
 
   return (
     <PageShell
       loading={loading && !data}
       error={error}
       empty={!!data && data.total === 0}
-      emptyDescription="还没有工作流。点击右上角「创建示例」快速创建一个最简单的 DAG。"
+      emptyDescription={
+        <Empty
+          description={
+            <span>
+              还没有工作流。工作流由 <Tag color="geekblue">App 类型插件</Tag> 创建和维护，
+              请前往左侧导航「应用插件」分组或插件管理子页面内创建。
+            </span>
+          }
+        />
+      }
       title="工作流"
       extra={
         <Space>
           <Tag color="blue">{(data?.total ?? 0).toString()} 个工作流</Tag>
           <Button onClick={() => void list()} icon={<ReloadOutlined />}>刷新</Button>
-          <Button type="primary" icon={<PlusOutlined />} onClick={onCreateSample}>创建示例</Button>
+          <Tooltip title="工作流归应用插件所有，不再允许 UI 直接创建。请从 app 插件的子页面里调用 host.workflows.create(...)。">
+            <Button type="primary" disabled icon={<PlusOutlined />} onClick={onCreateSample}>
+              创建示例
+            </Button>
+          </Tooltip>
         </Space>
       }
     >
@@ -107,7 +155,8 @@ export default function Workflows(): JSX.Element {
         size="small"
         rowKey="id"
         columns={cols}
-        dataSource={data?.items ?? []}
+        dataSource={(data?.items ?? []) as WorkflowViewModel[]}
+        scroll={{ x: 1600 }}
         pagination={{
           current: data?.page ?? 1,
           pageSize: data?.pageSize ?? 20,

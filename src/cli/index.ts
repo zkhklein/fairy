@@ -20,9 +20,18 @@ import { createInterface } from 'node:readline';
 
 const APP_DIR_NAME = 'fairy-maid-brigade';
 const DEFAULT_PORT = 18765;
+const FMB_PORTABLE_DIR = 'fmb-data';
+const FMB_PORTABLE_MARKER = '.fmb-portable-root';
 
-// ---------- HTTP meta file discovery ----------
-function getUserDataDir(): string {
+// ---------- Portable root discovery (mirrors runtime-paths.ts) ----------
+interface RuntimePaths {
+  mode: 'portable' | 'legacy';
+  userData: string;
+  logs: string;
+  plugins: string;
+}
+
+function _defaultLegacyRoot(): string {
   if (process.platform === 'win32' && process.env.APPDATA) {
     return path.join(process.env.APPDATA, APP_DIR_NAME);
   }
@@ -30,6 +39,40 @@ function getUserDataDir(): string {
     return path.join(os.homedir(), 'Library', 'Application Support', APP_DIR_NAME);
   }
   return path.join(os.homedir(), '.config', APP_DIR_NAME);
+}
+
+function resolveRuntimePaths(): RuntimePaths {
+  const candidates: string[] = [];
+  // 1. Packaged CLI next to the app's exe → look for fmb-data/ marker alongside
+  try { candidates.push(path.join(path.dirname(process.execPath), FMB_PORTABLE_DIR, FMB_PORTABLE_MARKER)); } catch { /* noop */ }
+  // 2. Dev project root .data (cwd)
+  try { candidates.push(path.join(process.cwd(), '.data', FMB_PORTABLE_MARKER)); } catch { /* noop */ }
+  for (const markerPath of candidates) {
+    if (!fs.existsSync(markerPath)) continue;
+    try {
+      const marker = JSON.parse(fs.readFileSync(markerPath, 'utf8')) as { portableRoot?: string };
+      if (marker.portableRoot) {
+        const root = marker.portableRoot;
+        return {
+          mode: 'portable',
+          userData: path.join(root, 'userData'),
+          logs: path.join(root, 'logs'),
+          plugins: path.join(root, 'plugins'),
+        };
+      }
+    } catch { /* corrupted; skip */ }
+  }
+  const legacy = _defaultLegacyRoot();
+  return { mode: 'legacy', userData: legacy, logs: path.join(legacy, 'logs'), plugins: path.join(legacy, 'plugins') };
+}
+
+// ---------- HTTP meta file discovery ----------
+function getUserDataDir(): string {
+  return resolveRuntimePaths().userData;
+}
+
+function getLogsDir(): string {
+  return resolveRuntimePaths().logs;
 }
 
 function getHttpMeta(): { port: number; token: string } | null {
@@ -452,8 +495,8 @@ program
   .option('--lines <n>', '显示行数', '50')
   .option('--level <l>', '按级别筛选')
   .action((opts) => safeRun(async () => {
-    const dir = getUserDataDir();
-    const logFile = path.join(dir, 'logs', 'main.log');
+    const dir = getLogsDir();
+    const logFile = path.join(dir, 'main.log');
     if (!fs.existsSync(logFile)) { console.error(`日志文件不存在: ${logFile}`); process.exit(1); }
     const content = fs.readFileSync(logFile, 'utf8');
     const lines = content.split('\n').filter(Boolean);

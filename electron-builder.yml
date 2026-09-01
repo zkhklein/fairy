@@ -1,4 +1,4 @@
-# ============================================================================
+﻿# ============================================================================
 # Fairy Maid Brigade — electron-builder 配置
 #
 # Windows 目标：x64 NSIS 安装包 + Portable 单文件
@@ -22,7 +22,7 @@ electronDownload:
 
 directories:
   buildResources: build-resources
-  output: dist4/
+  output: dist9/
 
 artifactName: "${productName} ${version} ${arch}.${ext}"
 

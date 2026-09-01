@@ -1,6 +1,5 @@
 import esbuild from 'esbuild';
 import path from 'node:path';
-import fs from 'node:fs';
 const ROOT = path.resolve(import.meta.dirname, '..');
 const OUT = path.join(ROOT, 'build/queue-max-attempts.mjs');
 await esbuild.build({

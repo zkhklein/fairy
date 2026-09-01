@@ -89,7 +89,7 @@ export default function ErrorCalendar(): JSX.Element {
       error={error}
       empty={!!data && data.total === 0}
       emptyDescription="好消息：当前查询范围内没有错误日志。🎉"
-      title="错误日历"
+      title="错误日志"
       extra={
         <Space wrap>
           <Tag color="red">error {perSeverity.get('error') ?? 0}</Tag>

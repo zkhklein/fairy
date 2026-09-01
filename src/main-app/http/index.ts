@@ -41,6 +41,30 @@ function problem(c: Context, status: number, title: string, detail: string): Res
   });
 }
 
+/**
+ * Serialize a plugin operation's Result.error (ProblemDetails) into a
+ * human-readable single-line detail text suitable for the problem() helper
+ * and RFC 7807 `detail` field. Mirrors pluginError() in ipc/handlers.ts so the
+ * same failure appears consistently whether triggered from UI/IPC or HTTP.
+ */
+function formatPluginProblem(err: any): { status: number; title: string; detail: string } {
+  const title: string = err?.title ?? 'Plugin operation failed';
+  const statusCode: number = Number.isFinite(Number(err?.status)) ? Math.max(400, Math.min(599, Number(err.status))) : 400;
+  const detail: string | undefined = err?.detail ? String(err.detail) : undefined;
+  const rawErrors: Array<{ path?: (string | number)[]; message?: string; code?: string }> =
+    Array.isArray(err?.errors) ? (err.errors as any[]) : [];
+  const issueLines = rawErrors.map(e => {
+    const loc = Array.isArray(e.path) && e.path.length ? ` (${e.path.map(String).join('/')})` : '';
+    const c = e.code ? `[${String(e.code)}]` : '';
+    return `•${c}${loc} ${String(e.message ?? '').trim()}`.trim();
+  });
+  const parts: string[] = [];
+  if (detail) parts.push(detail);
+  if (issueLines.length) parts.push(issueLines.join('; '));
+  const flat = parts.join(' — ');
+  return { status: statusCode, title, detail: flat || title };
+}
+
 function ensureToken(): string {
   const svc = getSettingsService();
   let token = svc.get('http.token');
@@ -142,7 +166,10 @@ export function startHttpServer(opts: { bootTs: number }): HttpServerHandle | nu
     const body = await c.req.json().catch(() => null) as { zipPath?: string } | null;
     if (!body?.zipPath) return problem(c, 400, 'Bad Request', 'zipPath required');
     const r = await getPluginService().installFromZip(body.zipPath);
-    if (!r.ok) return problem(c, 400, 'Install failed', (r as any).error?.title ?? 'install error');
+    if (!r.ok) {
+      const p = formatPluginProblem((r as any).error ?? { title: 'Install failed', status: 400 });
+      return problem(c, p.status, p.title || 'Install failed', p.detail);
+    }
     audit({ action: 'http.plugin.install', source: 'http', actor: 'http', payload: { zipPath: body.zipPath }, traceId: newTraceId() });
     const pid = (r as { pluginId?: string }).pluginId;
     const got = pid ? getPluginService().get(pid) : null;
@@ -166,10 +193,16 @@ export function startHttpServer(opts: { bootTs: number }): HttpServerHandle | nu
     const body = await c.req.json().catch(() => ({})) as { status?: string };
     if (body.status === 'enabled') {
       const r = await getPluginService().enablePlugin(id);
-      if (!r.ok) return problem(c, 400, 'Enable failed', 'enable error');
+      if (!r.ok) {
+        const p = formatPluginProblem((r as any).error ?? { title: 'Enable failed', status: 400 });
+        return problem(c, p.status, p.title || 'Enable failed', p.detail);
+      }
     } else if (body.status === 'disabled') {
       const r = await getPluginService().disablePlugin(id);
-      if (!r.ok) return problem(c, 400, 'Disable failed', 'disable error');
+      if (!r.ok) {
+        const p = formatPluginProblem((r as any).error ?? { title: 'Disable failed', status: 400 });
+        return problem(c, p.status, p.title || 'Disable failed', p.detail);
+      }
     }
     return c.json(getPluginService().get(id));
   });
@@ -179,15 +212,24 @@ export function startHttpServer(opts: { bootTs: number }): HttpServerHandle | nu
     const action = c.req.param('action');
     if (action === 'enable') {
       const r = await getPluginService().enablePlugin(id);
-      if (!r.ok) return problem(c, 400, 'Enable failed', 'enable error');
+      if (!r.ok) {
+        const p = formatPluginProblem((r as any).error ?? { title: 'Enable failed', status: 400 });
+        return problem(c, p.status, p.title || 'Enable failed', p.detail);
+      }
     } else if (action === 'disable') {
       const r = await getPluginService().disablePlugin(id);
-      if (!r.ok) return problem(c, 400, 'Disable failed', 'disable error');
+      if (!r.ok) {
+        const p = formatPluginProblem((r as any).error ?? { title: 'Disable failed', status: 400 });
+        return problem(c, p.status, p.title || 'Disable failed', p.detail);
+      }
     } else if (action === 'switch-version') {
       const body = await c.req.json().catch(() => ({})) as { version?: string };
       if (!body.version) return problem(c, 400, 'Bad Request', 'version required');
       const r = await getPluginService().switchVersion(id, body.version);
-      if (!r.ok) return problem(c, 400, 'Switch failed', 'version switch error');
+      if (!r.ok) {
+        const p = formatPluginProblem((r as any).error ?? { title: 'Version switch failed', status: 400 });
+        return problem(c, p.status, p.title || 'Switch failed', p.detail);
+      }
     } else {
       return problem(c, 400, 'Bad Request', `unknown action ${action}`);
     }
@@ -200,16 +242,17 @@ export function startHttpServer(opts: { bootTs: number }): HttpServerHandle | nu
   });
 
   app.post('/api/v1/workflows', async (c) => {
-    const p = await c.req.json().catch(() => ({})) as any;
-    const created = getWorkflowService().create({
-      id: p.id,
-      name: p.name,
-      description: p.description ?? '',
-      definition: p.definition ?? p.definition_json ?? {},
-      vars: p.vars ?? (p.vars_json ? JSON.parse(p.vars_json) : {}),
-    });
-    audit({ action: 'http.workflow.create', source: 'http', actor: 'http', payload: { id: p.id }, traceId: newTraceId() });
-    return c.json(created, 201);
+    // Following the ownership contract (v3), direct workflow creation is only
+    // permitted when the caller provides a trusted owner_plugin_id that
+    // corresponds to an installed + enabled app-type plugin. Plain HTTP
+    // callers (bearer-token only) do NOT carry plugin identity proof, so we
+    // return 403 with the same message shape used by the IPC channel.
+    return problem(
+      c,
+      403,
+      'Creation Disallowed',
+      '创建工作流仅允许从 app 插件 HostAPI 发起（工作流归应用插件所有）。请从对应应用插件的子页面内调用 host.workflows.create(...) 创建。',
+    );
   });
 
   app.get('/api/v1/workflows/:id', (c) => {

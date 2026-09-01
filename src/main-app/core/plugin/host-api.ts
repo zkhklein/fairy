@@ -35,6 +35,15 @@ export interface HostApiServices {
   onKvGet?: (key: string, global: boolean) => string | null;
   onKvSet?: (key: string, value: string, global: boolean) => boolean;
   onKvDelete?: (key: string, global: boolean) => boolean;
+  /**
+   * App-plugins can create workflows via Host.workflows.create(). This
+   * callback delegates to WorkflowService.create() inside the host process.
+   * Carried as a callback (instead of a cyclic import) so host-api.ts stays
+   * free of workflow-service references.
+   */
+  onCreateWorkflow?: (args: { id?: string; name: string; description?: string; definition: Record<string, unknown>; vars?: Record<string, unknown>; owner_plugin_id: string; }) => Record<string, unknown>;
+  onStartWorkflow?: (workflowId: string, input?: Record<string, unknown>) => Promise<{ runId: string; status: string }>;
+  onGetWorkflow?: (id: string) => Record<string, unknown> | null;
 }
 
 function notImplemented<T = never>(method: string): T {
@@ -116,8 +125,40 @@ export function buildHostApi(svc: HostApiServices): HostApi {
 
   // --- workflows ---
   const workflows: HostApi['workflows'] = {
-    async start(workflowId, input?) { return notImplemented('workflows.start(' + workflowId + ')'); },
-    async get(id) { return notImplemented('workflows.get(' + id + ')'); },
+    async create(args) {
+      // Enforce owner_plugin_id workflow-source contract: only plugins of
+      // type=app may create workflows, and owner always equals caller's own
+      // pluginId (plugins can't spoof ownership to another app plugin).
+      if (!svc.selfManifest) {
+        throw new Error('Host.workflows.create requires plugin context (missing selfManifest)');
+      }
+      if (svc.selfManifest.type !== 'app') {
+        throw new Error(
+          `Host.workflows.create: plugin "${owner}" has type=${svc.selfManifest.type}; only type=app plugins can create workflows`,
+        );
+      }
+      if (!svc.onCreateWorkflow) {
+        throw new Error('Host.workflows.create: host did not wire onCreateWorkflow callback');
+      }
+      const created = svc.onCreateWorkflow({
+        id: args.id,
+        name: args.name,
+        description: args.description,
+        definition: args.definition,
+        vars: args.vars,
+        owner_plugin_id: owner,
+      });
+      return created as unknown as ReturnType<HostApi['workflows']['create']>;
+    },
+    async start(workflowId, input) {
+      if (!svc.onStartWorkflow) return notImplemented('workflows.start(' + workflowId + ')');
+      return svc.onStartWorkflow(workflowId, input ?? {}) as ReturnType<HostApi['workflows']['start']>;
+    },
+    async get(id) {
+      if (!svc.onGetWorkflow) return notImplemented('workflows.get(' + id + ')');
+      const got = svc.onGetWorkflow(id);
+      return got as unknown as ReturnType<HostApi['workflows']['get']>;
+    },
   };
   // --- schedules ---
   const schedules: HostApi['schedules'] = {

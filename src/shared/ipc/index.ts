@@ -94,7 +94,9 @@ export const main_plugin_validateManifest = make({
 export const main_workflow_list = make({
   channel: 'main:workflow.list',
   params: PaginationQuerySchema.extend({ q: z.string().max(64).optional() }),
-  result: PagedSchema(WorkflowSchema),
+  // The crud service now joins owner plugin metadata + scans definition for
+  // referenced plugin ids / node counts → use the enriched view model.
+  result: PagedSchema(WorkflowViewModelSchema),
 });
 
 export const main_workflow_get = make({

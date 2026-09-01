@@ -7,6 +7,21 @@ import { fileURLToPath } from 'node:url';
 // regardless of whether we're packaged or running via the raw Electron binary.
 app.setName('fairy-maid-brigade');
 
+// Portable storage layout MUST be applied BEFORE app.whenReady().
+// Electron silently ignores setPath() calls after boot.
+import { applyPortablePathsAndMigrate } from './core/runtime-paths';
+
+const __RUNTIME_PATHS__ = (() => {
+  try {
+    return applyPortablePathsAndMigrate();
+  } catch (e) {
+    // If anything explodes, log to stderr and let the default paths kick in.
+    // eslint-disable-next-line no-console
+    console.error('[fmb] applyPortablePathsAndMigrate failed:', e);
+    return null;
+  }
+})();
+
 import { initDatabase, closeDatabase } from './core/db';
 import { createLogger } from './core/logger';
 import { audit, newTraceId } from './core/audit';
@@ -28,6 +43,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Write boot markers to userData (always writable) instead of the relative
 // path inside app.asar (read-only in packaged mode → silent write failures
 // → no diagnostic logs). In dev mode fall back to project root for convenience.
+// If portable mode was applied, userData has already been redirected to
+// fmb-data/userData so this naturally lands alongside the portable db.
 const MARKER_FILE = (() => {
   try {
     return path.join(app.getPath('userData'), 'boot-markers.log');
@@ -53,6 +70,12 @@ function mk(tag: string, extra?: unknown): void {
     fs.appendFileSync(MARKER_FILE, line, 'utf8');
   } catch { /* noop */ }
 }
+mk('APPLY_PATHS_MODE', {
+  mode: __RUNTIME_PATHS__?.mode ?? 'legacy',
+  portableRoot: __RUNTIME_PATHS__?.portableRoot ?? null,
+  userData: __RUNTIME_PATHS__?.userData ?? null,
+  migratedFrom: __RUNTIME_PATHS__?.migratedFrom ?? null,
+});
 mk('MAIN_MODULE_LOAD', { pid: process.pid, argv0: process.argv0, electronVer: process.versions.electron, nodeVer: process.versions.node });
 process.on('uncaughtException', (err) => mk('UNCAUGHT', { name: err.name, message: err.message, stack: err.stack }));
 process.on('unhandledRejection', (r) => mk('UNHANDLED', { reason: String(r) }));
@@ -227,6 +250,23 @@ app.whenReady().then(() => {
     const pluginSvc = initPluginService();
     mk('PLUGIN_SERVICE_OK', { pluginsDir: pluginSvc.root });
     const workflowSvc = initWorkflowService(bus, pluginSvc);
+    // Wire Host.workflows.create/start/get callbacks so app plugins create
+    // workflows with owner_plugin_id auto-filled (enforced ownership contract).
+    pluginSvc.setWorkflowCallbacks({
+      create: (a) => workflowSvc.create({
+        id: a.id,
+        name: a.name,
+        description: a.description,
+        definition: a.definition as any,
+        vars: a.vars,
+        owner_plugin_id: a.owner_plugin_id,
+      }) as unknown as Record<string, unknown>,
+      start: async (workflowId, input) => {
+        const r = await workflowSvc.run(workflowId, input);
+        return { runId: r.id, status: r.status };
+      },
+      get: (id) => workflowSvc.getViewModel(id) as unknown as Record<string, unknown> | null,
+    });
     mk('WORKFLOW_SERVICE_OK');
     const schedulerSvc = initSchedulerService(bus, workflowSvc);
     mk('SCHEDULER_SERVICE_OK');

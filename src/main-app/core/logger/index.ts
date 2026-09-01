@@ -24,16 +24,46 @@ let sharedBase: string | null = null;
 
 function resolveLogsDir(): string {
   if (sharedBase) return sharedBase;
-  let root: string;
-  if (app.isPackaged) {
-    root = app.getPath('userData');
-  } else {
-    root = path.join(app.getAppPath(), '.data');
+  // Marker-first resolution: see resolveDbPath in db/index.ts for rationale.
+  // If the portable marker file exists, use {portableRoot}/logs regardless of
+  // what app.getPath('logs') returns. Works around ESM hoisting causing
+  // setPath to run after app is ready in packaged builds.
+  let logsDir: string | undefined;
+  try {
+    const portableDir = 'fmb-data';
+    const markerName = '.fmb-portable-root';
+    try {
+      const marker = path.join(path.dirname(app.getPath('exe')), portableDir, markerName);
+      if (fs.existsSync(marker)) {
+        const m = JSON.parse(fs.readFileSync(marker, 'utf8')) as { portableRoot?: string };
+        if (m.portableRoot) logsDir = path.join(m.portableRoot, 'logs');
+      }
+    } catch { /* noop */ }
+    if (!logsDir) {
+      try {
+        const markerDev = path.join(process.cwd(), '.data', markerName);
+        if (fs.existsSync(markerDev)) {
+          const m = JSON.parse(fs.readFileSync(markerDev, 'utf8')) as { portableRoot?: string };
+          if (m.portableRoot) logsDir = path.join(m.portableRoot, 'logs');
+        }
+      } catch { /* noop */ }
+    }
+  } catch { /* noop */ }
+  if (!logsDir) {
+    // Portable mode: Electron setPath('logs') has already redirected to
+    // {portableRoot}/logs. Dev mode: setPath didn't run but runtime-paths
+    // guaranteed the .data tree exists, so app.getPath('logs') still wins.
+    let root: string;
+    try {
+      root = app.getPath('logs');
+    } catch {
+      root = path.join(app.getPath('userData'), 'logs');
+    }
+    logsDir = root;
   }
-  const dir = path.join(root, 'logs');
-  fs.mkdirSync(dir, { recursive: true });
-  sharedBase = dir;
-  return dir;
+  fs.mkdirSync(logsDir, { recursive: true });
+  sharedBase = logsDir;
+  return logsDir;
 }
 
 function buildStreams(name: string): pino.StreamEntry<pino.Level>[] {

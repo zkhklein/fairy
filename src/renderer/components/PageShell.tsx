@@ -19,7 +19,8 @@ export interface PageShellProps {
   loading?: boolean;
   error?: string | null;
   empty?: boolean;
-  emptyDescription?: string;
+  /** String or rich React content passed through to AntD Empty.description. */
+  emptyDescription?: ReactNode;
   children: ReactNode;
   title?: ReactNode;
   extra?: ReactNode;

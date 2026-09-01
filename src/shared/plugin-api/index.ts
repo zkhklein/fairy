@@ -109,6 +109,16 @@ export const HostKvSet = method(
 export const HostKvDelete = method(z.object({ key: z.string().min(1), global: z.boolean().default(false) }), z.object({ ok: z.literal(true) }));
 
 // ============ Workflow engine ============
+export const HostWorkflowCreate = method(
+  z.object({
+    name: z.string().min(1).max(256),
+    description: z.string().max(2000).default(''),
+    definition: z.record(z.string(), z.unknown()),
+    vars: z.record(z.string(), z.unknown()).default({}),
+    id: z.string().min(1).optional(),
+  }),
+  WorkflowSchema,
+);
 export const HostWorkflowStart = method(
   z.object({ workflowId: z.string().min(1), input: z.record(z.string(), z.unknown()).default({}) }),
   z.object({ runId: z.string().min(1), status: WorkflowRunStatus }),
@@ -195,6 +205,7 @@ export interface HostApi {
     delete(key: string, global?: boolean): Promise<{ ok: true }>;
   };
   workflows: {
+    create(args: { name: string; description?: string; definition: Record<string, unknown>; vars?: Record<string, unknown>; id?: string }): Promise<z.infer<typeof WorkflowSchema>>;
     start(workflowId: string, input?: Record<string, unknown>): Promise<{ runId: string; status: z.infer<typeof WorkflowRunStatus> }>;
     get(id: string): Promise<z.infer<typeof WorkflowSchema> | null>;
   };
@@ -230,7 +241,7 @@ export const HostContracts = {
   audit: { record: HostAuditRecord },
   secrets: { get: HostSecretGet, set: HostSecretSet, delete: HostSecretDelete },
   kv: { get: HostKvGet, set: HostKvSet, delete: HostKvDelete },
-  workflows: { start: HostWorkflowStart, get: HostWorkflowGet },
+  workflows: { create: HostWorkflowCreate, start: HostWorkflowStart, get: HostWorkflowGet },
   schedules: { create: HostScheduleCreate, toggle: HostScheduleToggle },
   jobs: { enqueue: HostJobEnqueue, get: HostJobGet, cancel: HostJobCancel },
   plugins: { self: HostPluginSelf, list: HostPluginList },
