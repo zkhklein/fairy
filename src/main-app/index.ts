@@ -204,9 +204,8 @@ function createWindow(): void {
       .then((cnt: string) => mk('RENDERER_DOM', { rootChildren: cnt }))
       .catch((err: unknown) => mk('RENDERER_DOM_ERR', { msg: (err as Error).message }));
   });
-  // Temporarily auto-open DevTools in packaged mode for blank-screen diagnosis.
-  // TODO: remove once root cause is fixed.
-  if (app.isPackaged) {
+  // DevTools auto-open only in development — packaged mode stays clean for end users.
+  if (!app.isPackaged) {
     wc.on('dom-ready', () => {
       wc.openDevTools({ mode: 'detach' });
     });
@@ -269,6 +268,20 @@ app.whenReady().then(() => {
     });
     mk('WORKFLOW_SERVICE_OK');
     const schedulerSvc = initSchedulerService(bus, workflowSvc);
+    // Wire Host.schedules.create/toggle callbacks so app plugins can register
+    // cron schedules (e.g. the watchdog plugin's */2 * * * * keepalive loop).
+    pluginSvc.setScheduleCallbacks({
+      create: (a) => schedulerSvc.create({
+        id: a.id,
+        name: a.name,
+        cronExpr: a.cronExpr,
+        oneShotAtMs: a.oneShotAtMs,
+        workflowId: a.workflowId,
+        input: a.input ?? {},
+        enabled: a.enabled ?? true,
+      }) as unknown as Record<string, unknown>,
+      toggle: (id, enabled) => schedulerSvc.toggle(id, enabled) as unknown as Record<string, unknown> | null,
+    });
     mk('SCHEDULER_SERVICE_OK');
     const queueSvc = initQueueService(bus);
     mk('QUEUE_SERVICE_OK');

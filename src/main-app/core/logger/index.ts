@@ -18,36 +18,20 @@ import pino, { type Logger, type LoggerOptions } from 'pino';
 import prettyFactory from 'pino-pretty';
 import { createStream } from 'rotating-file-stream';
 import { app } from 'electron';
+import { resolvePortableRootFromMarkers } from '../runtime-paths';
 
 const loggerCache = new Map<string, Logger>();
 let sharedBase: string | null = null;
 
 function resolveLogsDir(): string {
   if (sharedBase) return sharedBase;
-  // Marker-first resolution: see resolveDbPath in db/index.ts for rationale.
-  // If the portable marker file exists, use {portableRoot}/logs regardless of
-  // what app.getPath('logs') returns. Works around ESM hoisting causing
-  // setPath to run after app is ready in packaged builds.
+  // Marker-first (plus SFX env-writable auto-portable) resolution via SSOT in
+  // runtime-paths. Works around ESM hoisting causing setPath to silently fail
+  // after app is ready in packaged builds.
   let logsDir: string | undefined;
   try {
-    const portableDir = 'fmb-data';
-    const markerName = '.fmb-portable-root';
-    try {
-      const marker = path.join(path.dirname(app.getPath('exe')), portableDir, markerName);
-      if (fs.existsSync(marker)) {
-        const m = JSON.parse(fs.readFileSync(marker, 'utf8')) as { portableRoot?: string };
-        if (m.portableRoot) logsDir = path.join(m.portableRoot, 'logs');
-      }
-    } catch { /* noop */ }
-    if (!logsDir) {
-      try {
-        const markerDev = path.join(process.cwd(), '.data', markerName);
-        if (fs.existsSync(markerDev)) {
-          const m = JSON.parse(fs.readFileSync(markerDev, 'utf8')) as { portableRoot?: string };
-          if (m.portableRoot) logsDir = path.join(m.portableRoot, 'logs');
-        }
-      } catch { /* noop */ }
-    }
+    const portableRoot = resolvePortableRootFromMarkers({ autoPortableOnEnvWritable: true });
+    if (portableRoot) logsDir = path.join(portableRoot, 'logs');
   } catch { /* noop */ }
   if (!logsDir) {
     // Portable mode: Electron setPath('logs') has already redirected to

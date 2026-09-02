@@ -12,9 +12,14 @@
  *   workflows: { start(), get() both Promises }
  *   schedules: { create(), toggle() Promises }
  *   jobs: { enqueue(), get(), cancel() Promises }
+ *   processes: { query(): Promise<Record<name,bool>>; start(): Promise<{pid,...}> }
  *   eventBus: { on/once/emit sync returns }
  *   logger: { log/debug/info/warn/error sync }
  */
+import { execSync, spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { dirname, isAbsolute, basename } from 'node:path';
+import { nanoid } from 'nanoid';
 import type {
   HostApi,
   PluginManifest,
@@ -41,9 +46,16 @@ export interface HostApiServices {
    * Carried as a callback (instead of a cyclic import) so host-api.ts stays
    * free of workflow-service references.
    */
-  onCreateWorkflow?: (args: { id?: string; name: string; description?: string; definition: Record<string, unknown>; vars?: Record<string, unknown>; owner_plugin_id: string; }) => Record<string, unknown>;
+  onCreateWorkflow?: (args: { id?: string; name: string; description?: string; definition: Record<string, unknown>; vars?: Record<string, unknown>; owner_plugin_id?: string | null; }) => Record<string, unknown>;
   onStartWorkflow?: (workflowId: string, input?: Record<string, unknown>) => Promise<{ runId: string; status: string }>;
   onGetWorkflow?: (id: string) => Record<string, unknown> | null;
+  /**
+   * App-plugins can create schedules via Host.schedules.create(). The actual
+   * scheduling is performed by SchedulerService (cron) so plugins can't
+   * overload the event loop with per-plugin setInterval loops.
+   */
+  onCreateSchedule?: (args: { id?: string; name: string; cronExpr?: string; oneShotAtMs?: number; workflowId: string; input?: Record<string, unknown>; enabled?: boolean; owner_plugin_id: string; }) => Record<string, unknown>;
+  onToggleSchedule?: (id: string, enabled: boolean) => Record<string, unknown> | null;
 }
 
 function notImplemented<T = never>(method: string): T {
@@ -162,8 +174,38 @@ export function buildHostApi(svc: HostApiServices): HostApi {
   };
   // --- schedules ---
   const schedules: HostApi['schedules'] = {
-    async create(args) { return notImplemented('schedules.create(' + args.name + ')'); },
-    async toggle(id, enabled) { return notImplemented('schedules.toggle(' + id + ')'); },
+    async create(args) {
+      if (!svc.selfManifest) {
+        throw new Error('Host.schedules.create requires plugin context (missing selfManifest)');
+      }
+      if (svc.selfManifest.type !== 'app') {
+        throw new Error(
+          `Host.schedules.create: plugin "${owner}" has type=${svc.selfManifest.type}; only type=app plugins can create schedules`,
+        );
+      }
+      if (!svc.onCreateSchedule) {
+        throw new Error('Host.schedules.create: host did not wire onCreateSchedule callback');
+      }
+      const created = svc.onCreateSchedule({
+        id: args.id,
+        name: args.name,
+        cronExpr: args.cron,
+        oneShotAtMs: args.oneShotAtMs,
+        workflowId: args.workflowId,
+        input: args.input ?? {},
+        enabled: args.enabled ?? true,
+        owner_plugin_id: owner,
+      });
+      return created as unknown as ReturnType<HostApi['schedules']['create']>;
+    },
+    async toggle(id, enabled) {
+      if (!svc.selfManifest) {
+        throw new Error('Host.schedules.toggle requires plugin context');
+      }
+      if (!svc.onToggleSchedule) return notImplemented('schedules.toggle(' + id + ')');
+      const r = svc.onToggleSchedule(id, !!enabled);
+      return r as unknown as ReturnType<HostApi['schedules']['toggle']>;
+    },
   };
   // --- jobs ---
   const jobs: HostApi['jobs'] = {
@@ -210,6 +252,46 @@ export function buildHostApi(svc: HostApiServices): HostApi {
         } satisfies Record<string, any>;
       });
     },
+    async invoke({ pluginId, method, payload }) {
+      // Contract: HostPluginInvoke params already parsed by shared zod at
+      // Proxy-level schema check. Additional runtime checks here for safety.
+      if (!pluginId || typeof pluginId !== 'string') throw new Error('plugins.invoke: pluginId required');
+      if (!method || typeof method !== 'string') throw new Error('plugins.invoke: method required');
+      if (method === 'activate' || method === 'deactivate') {
+        throw new Error(`plugins.invoke: refusing to call lifecycle method \`${method}\` on plugin ${pluginId}`);
+      }
+      if (pluginId === owner) {
+        throw new Error('plugins.invoke: refusing to self-invoke. Use the local function directly.');
+      }
+      const row = svc.pluginService.get(pluginId);
+      if (!row) throw new Error(`plugins.invoke: target plugin not installed (${pluginId})`);
+      if ((row.status ?? 'installed') !== 'enabled') {
+        throw new Error(`plugins.invoke: target plugin not enabled (${pluginId}). status=${row.status ?? 'installed'}`);
+      }
+      const inst = svc.pluginService.loadedInstance(pluginId);
+      if (!inst) throw new Error(`plugins.invoke: no loaded instance for enabled plugin ${pluginId}. Internal loader bug.`);
+      const exp: any = inst.sandbox?.module?.exports ?? null;
+      if (!exp || typeof exp !== 'object') {
+        throw new Error(`plugins.invoke: target ${pluginId} has no module.exports (not a sandboxed plugin?).`);
+      }
+      const fn: unknown = (exp as Record<string, unknown>)[method];
+      if (typeof fn !== 'function') {
+        const available = Object.keys(exp).filter(k => typeof (exp as Record<string, unknown>)[k] === 'function').slice(0, 20);
+        throw new Error(`plugins.invoke: target ${pluginId} exports has no callable method \`${method}\`. Available functions: ${available.join(', ')}`);
+      }
+      let result: any;
+      try {
+        result = await Promise.resolve(fn.call(undefined, payload));
+      } catch (rawErr: any) {
+        const msg = rawErr && rawErr.message ? String(rawErr.message) : String(rawErr);
+        const stack = rawErr && rawErr.stack ? String(rawErr.stack) : undefined;
+        try { svc.onError?.({ level: 'warn', source: `plugin:${owner}->${pluginId}.${method}`, message: `cross-plugin call failed: ${msg}`, stack, traceId: nanoid(12) }); } catch { /* swallow */ }
+        const err: any = new Error(`plugins.invoke: ${pluginId}.${method} threw: ${msg}`);
+        err.cause = rawErr;
+        throw err;
+      }
+      return result;
+    },
   };
 
   // --- extensions ---
@@ -225,10 +307,23 @@ export function buildHostApi(svc: HostApiServices): HostApi {
       return { id: undefined };
     },
     async call(point, payload) {
-      const results: unknown[] = [];
-      await svc.eventBus.safeEmit(point as any, payload, { source: `plugin:${owner}:extensions.call` });
-      // Event bus doesn't return handler return values directly; collect from a side-channel
-      // by temporarily invoking listeners manually once. Accept best-effort empty array here.
+      // NOTE: Permission `extensions:call` is enforced at the sandbox Proxy
+      // level (see PERMISSION_RULES in sandbox.ts). Individual hostApi methods
+      // don't re-check permissions inline.
+      // Use bus.callAndCollect so handler return values are actually surfaced
+      // to the caller. Plugins rely on this for cross-plugin orchestration
+      // (e.g. watchdog app calls atomic's onCheck → gets back {running, ...}).
+      if (typeof (svc.eventBus as any).callAndCollect !== 'function') {
+        // EventBus too old; safeEmit and return empty (shouldn't happen).
+        await svc.eventBus.safeEmit(point as any, payload, { source: `plugin:${owner}:extensions.call` });
+        return [];
+      }
+      const res = await (svc.eventBus as any).callAndCollect(point as any, payload, { source: `plugin:${owner}:extensions.call` });
+      // For each returned value that isn't undefined → include in results.
+      // Preserve order; filter out undefined handler returns so "no handlers"
+      // ([]) is distinguishable from "handlers returned void" (all undefined → [])
+      // but consumers do `if (results.length > 0) return results[0]` so OK.
+      const results: unknown[] = Array.isArray(res?.values) ? res.values : [];
       return results;
     },
   };
@@ -246,6 +341,150 @@ export function buildHostApi(svc: HostApiServices): HostApi {
     },
   };
 
+  // --- system / processes (new for watcher plugins) ---
+  const processes: HostApi['processes'] = {
+    /**
+     * Query whether each image name in the list is currently running.
+     * Win-only: `tasklist /FO CSV /NH`; cross-platform fallback uses
+     * `ps -eo comm=` on darwin/linux so the same call works for future
+     * packaging targets.
+     *
+     * NEVER kills / disturbs processes — only reads. Exactly the "just check
+     * don't disturb" contract our watchers rely on.
+     */
+    async query(args): Promise<Record<string, boolean>> {
+      const names = args.processNames || [];
+      const wanted = new Map<string, string>(); // key=normalized, value=original
+      for (const n of names) {
+        const k = basename(n).replace(/\.exe$/i, '').toLowerCase();
+        if (k) wanted.set(k, n);
+      }
+      const result: Record<string, boolean> = {};
+      for (const n of names) result[n] = false;
+      if (wanted.size === 0) return result;
+      try {
+        const platform = process.platform;
+        if (platform === 'win32') {
+          // tasklist is ~20-60 ms, safe to execSync (infrequent poll from watcher).
+          const out = execSync('tasklist /FO CSV /NH', {
+            encoding: 'utf8',
+            windowsHide: true,
+            timeout: 3000,
+            stdio: ['ignore', 'pipe', 'ignore'],
+          });
+          for (const row of out.split(/\r?\n/)) {
+            if (!row) continue;
+            const m = row.match(/^"([^"]+)"/);
+            if (!m) continue;
+            const norm = basename(m[1]).replace(/\.exe$/i, '').toLowerCase();
+            if (wanted.has(norm)) {
+              const original = wanted.get(norm)!;
+              result[original] = true;
+            }
+          }
+        } else {
+          // macOS / linux (future)
+          const out = execSync('ps -eo comm=', {
+            encoding: 'utf8',
+            timeout: 3000,
+            stdio: ['ignore', 'pipe', 'ignore'],
+          });
+          for (const raw of out.split(/\r?\n/)) {
+            const norm = basename(raw.trim()).replace(/\.exe$/i, '').toLowerCase();
+            if (norm && wanted.has(norm)) {
+              result[wanted.get(norm)!] = true;
+            }
+          }
+        }
+      } catch (e) {
+        // Surface as warn but don't throw — the poll is best-effort; callers
+        // should treat all-false as "unknown" and not blindly restart.
+        try {
+          logger.warn('processes.query tasklist/ps failed (returning all false)', {
+            error: e instanceof Error ? e.message : String(e),
+          });
+        } catch {}
+      }
+      return result;
+    },
+
+    /**
+     * Start an executable detached (default). ONLY starts if the file exists.
+     * Does NOT disturb any running instance — spawn is additive. Exactly the
+     * "don't disturb running software — only restart if actually exited"
+     * contract. Callers should run `query` first and only call `start` if
+     * the target returned false.
+     */
+    async start(args) {
+      const { executablePath, args: cmdArgs = [], cwd, detached = true, timeoutMs = 30_000 } = args;
+      if (!isAbsolute(executablePath)) {
+        throw new Error(
+          `processes.start: executablePath must be absolute (received: ${JSON.stringify(executablePath)})`,
+        );
+      }
+      if (!existsSync(executablePath)) {
+        throw new Error(`processes.start: executable not found at ${executablePath}`);
+      }
+      // Anti self-destruct: never allow starting our own electron.exe again
+      // (prevents plugin mistakes from spawning FMB copies in a loop).
+      const normTarget = basename(executablePath).toLowerCase();
+      const normSelf = basename(process.execPath).toLowerCase();
+      if (normTarget === normSelf && normTarget.endsWith('.exe')) {
+        throw new Error(
+          'processes.start: refusing to start the host executable itself (would fork-bomb)',
+        );
+      }
+      const workDir = cwd && isAbsolute(cwd) ? cwd : dirname(executablePath);
+      const spawnedAtMs = Date.now();
+      const child = spawn(executablePath, cmdArgs, {
+        detached,
+        stdio: 'ignore',
+        cwd: workDir,
+        windowsHide: true,
+        shell: false,
+      });
+      // Wait up to timeoutMs for a valid positive PID. spawn reports errors
+      // asynchronously via 'error'; we translate into a throw so the plugin
+      // can retry next poll instead of silently failing.
+      return await new Promise<{ pid: number; spawnedAtMs: number; alreadyRunning: boolean }>(
+        (resolve, reject) => {
+          let done = false;
+          const timer = setTimeout(() => {
+            if (done) return;
+            done = true;
+            reject(new Error(`processes.start: timed out after ${timeoutMs}ms`));
+          }, timeoutMs);
+          child.once('error', (e) => {
+            if (done) return;
+            done = true;
+            clearTimeout(timer);
+            reject(e);
+          });
+          // spawn() sets child.pid synchronously on Windows for our
+          // non-shell use; add a microtick delay so 'error' races are safe.
+          queueMicrotask(() => {
+            if (done) return;
+            const pid = child.pid;
+            if (!pid || pid <= 0) {
+              done = true;
+              clearTimeout(timer);
+              reject(new Error('processes.start: spawn returned no PID'));
+              return;
+            }
+            // Detached: unref so this long-running external program does NOT
+            // keep FMB alive when the user closes the app.
+            if (detached) {
+              try { child.unref(); } catch {}
+            }
+            done = true;
+            clearTimeout(timer);
+            resolve({ pid, spawnedAtMs, alreadyRunning: false });
+          });
+        },
+      );
+    },
+  };
+
   return {
     eventBus,
     logger,
@@ -258,6 +497,7 @@ export function buildHostApi(svc: HostApiServices): HostApi {
     plugins,
     extensions,
     ui,
+    processes,
   };
 }
 

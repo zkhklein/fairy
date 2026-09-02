@@ -297,6 +297,93 @@ export class EventBusService {
   }
 
   /**
+   * Like safeEmit, but also collects each handler's return value into
+   * `values[]` (in handler order). Used by `hostApi.extensions.call` so
+   * plugins can invoke cross-plugin extension-point handlers and receive
+   * results back (e.g. atomic watchers → return `{ running, execPath, ... }`
+   * to the app watchdog orchestrator).
+   *
+   * Return shape intentionally includes stats so callers can distinguish
+   * "no handlers matched" (totalListeners===0, values===[]) from
+   * "handlers matched but all returned undefined" (values filled with
+   * undefined, totalListeners>0).
+   */
+  async callAndCollect<E extends string>(
+    event: E,
+    payload: E extends ExtensionPointName ? ExtensionPayload<E> : any,
+    ctx: { traceId?: string; source?: string; strict?: boolean } = {},
+  ): Promise<{ values: unknown[]; totalListeners: number; errors: number; durationMs: number; traceId: string; failures: Array<{ meta: HandlerMeta; message: string; stack?: string }> }> {
+    const start = performance.now();
+    const traceId = ctx.traceId || nanoid(16);
+    const source = ctx.source ?? 'eventBus.callAndCollect';
+
+    // Replicate safeEmit's ordered-handler resolution exactly so behaviour
+    // parity is guaranteed: exact + wildcard matches, EventEmitter2 order.
+    const matchedListeners = new Map<Function, HandlerMeta>();
+    for (const [pattern, entries] of this.entries) {
+      if (!pattern.includes('*')) {
+        if (pattern === event) {
+          for (const e of entries) matchedListeners.set(e.rawListener, e.meta);
+        }
+        continue;
+      }
+      const isMatch = wildcardStringMatch(event as string, pattern);
+      if (isMatch) {
+        for (const e of entries) matchedListeners.set(e.rawListener, e.meta);
+      }
+    }
+    const emitterListeners = this.emitter.listeners(event as any) as Array<(...args: any[]) => any>;
+    const orderedHandlers: Array<{ fn: (...args: any[]) => any; meta: HandlerMeta }> = [];
+    for (const l of emitterListeners) {
+      const meta = matchedListeners.get(l) ?? {
+        name: l.name || '<anonymous>',
+        owner: 'unknown',
+        kind: 'exact',
+        async: l.constructor.name === 'AsyncFunction',
+      };
+      orderedHandlers.push({ fn: l, meta });
+    }
+
+    const values: unknown[] = [];
+    const failures: Array<{ meta: HandlerMeta; message: string; stack?: string }> = [];
+    let errors = 0;
+    for (const { fn, meta } of orderedHandlers) {
+      try {
+        const result = fn(payload);
+        if (result != null && typeof result === 'object' && typeof (result as Promise<any>).then === 'function') {
+          values.push(await result);
+        } else {
+          values.push(result);
+        }
+      } catch (rawErr) {
+        const err = rawErr instanceof Error ? rawErr : new Error(String(rawErr));
+        errors += 1;
+        values.push(undefined);
+        failures.push({ meta, message: err.message, stack: err.stack });
+        try {
+          _fallbackSink({
+            level: 'warn',
+            source: `${source}:${event}:${meta.owner}`,
+            message: `handler error: ${err.message}`,
+            stack: err.stack,
+            traceId,
+          });
+        } catch { /* swallow */ }
+      }
+    }
+
+    const durationMs = Math.round(performance.now() - start);
+    if (ctx.strict && failures.length > 0) {
+      const msg = `${failures.length} callAndCollect handler(s) failed for ${event}`;
+      const err = (typeof AggregateError !== 'undefined')
+        ? new AggregateError(failures.map(f => new Error(f.message, { cause: f.stack })), msg)
+        : new Error(msg);
+      throw err;
+    }
+    return { values, totalListeners: orderedHandlers.length, errors, durationMs, traceId, failures };
+  }
+
+  /**
    * Return rich listener metadata for a given event / wildcard pattern.
    * If event is left empty returns all bindings.
    *

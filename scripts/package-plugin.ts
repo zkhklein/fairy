@@ -38,6 +38,10 @@ const ALL_PLUGINS = [
   'atomic/demo-echo',
   'app/demo-counter',
   'extension/demo-install-notify',
+  // Watchers suite — `plugins-source/watchers/…` (future standalone git repo root)
+  'watchers/atomic/fmb-watcher-traework',
+  'watchers/atomic/fmb-watcher-chatgpt',
+  'watchers/app/fmb-watchdog',
 ];
 
 async function packageOne(rel: string): Promise<string> {

@@ -18,8 +18,10 @@ export interface CreateWorkflowArgs {
   description?: string;
   definition: WorkflowDefinition | string;
   vars?: Record<string, unknown>;
-  /** Mandatory owner — must correspond to a type='app' plugin. */
-  owner_plugin_id: string;
+  /** App plugin that created / owns this workflow. NULL means host-owned (not
+   *  tied to a specific app plugin). When provided it must correspond to an
+   *  installed type='app' plugin. */
+  owner_plugin_id?: string | null;
 }
 
 export interface WorkflowRow {
@@ -28,7 +30,7 @@ export interface WorkflowRow {
   description: string;
   definition_json: string;
   vars_json: string;
-  owner_plugin_id: string;
+  owner_plugin_id: string | null;
   created_at: number;
   updated_at: number;
 }
@@ -45,10 +47,16 @@ export class WorkflowService {
   create(args: CreateWorkflowArgs): WorkflowRow {
     const db = getRawDb();
     // Verify owner is a type=app plugin (belt-and-suspenders alongside the DB
-    // triggers we install in migration 002).
-    const owner = db.prepare('SELECT type FROM plugins WHERE id = ?').get(args.owner_plugin_id) as { type?: string } | undefined;
-    if (!owner || owner.type !== 'app') {
-      throw new Error(`owner_plugin_id=${args.owner_plugin_id} must correspond to a type='app' plugin`);
+    // triggers we install in migration 003). NULL owner = host-owned (allowed).
+    if (args.owner_plugin_id != null) {
+      const owner = db.prepare('SELECT type FROM plugins WHERE id = ?').get(args.owner_plugin_id) as
+        | { type?: string }
+        | undefined;
+      if (!owner || owner.type !== 'app') {
+        throw new Error(
+          `owner_plugin_id=${args.owner_plugin_id} must correspond to a type='app' plugin or be null/omitted`,
+        );
+      }
     }
     const id = args.id ?? `wf-${nanoid(10)}`;
     const now = Date.now();
@@ -125,7 +133,7 @@ export class WorkflowService {
   getViewModel(id: string): {
     id: string; name: string; description: string;
     definition_json: string; vars_json: string;
-    owner_plugin_id: string;
+    owner_plugin_id: string | null;
     owner_name?: string;
     owner_type?: string;
     referenced_plugin_ids: string[];
@@ -280,7 +288,7 @@ export class WorkflowService {
       description: data.description,
       definition: JSON.stringify(data.definition ?? data.definition_json),
       vars: data.vars ?? JSON.parse(data.vars_json ?? '{}'),
-      owner_plugin_id: ownerPluginId ?? data.owner_plugin_id ?? 'com.fmb.host',
+      owner_plugin_id: ownerPluginId ?? data.owner_plugin_id ?? null,
     });
   }
 

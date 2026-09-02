@@ -1,0 +1,13 @@
+{
+  "name": "@fmb/watchers-suite",
+  "version": "0.1.0",
+  "private": true,
+  "description": "FMB Watchers Suite — 后台值守类插件集合（App 插件 + 若干 Atomic 插件）。本目录是未来独立 git 仓库的仓根：拆分时把 plugins-source/watchers/ 当作新仓根即可。",
+  "keywords": ["fmb-plugins", "suite", "watchdog", "watchers", "daemon"],
+  "license": "MIT",
+  "plugins": [
+    "app/fmb-watchdog",
+    "atomic/fmb-watcher-traework",
+    "atomic/fmb-watcher-chatgpt"
+  ]
+}

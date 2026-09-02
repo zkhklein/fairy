@@ -67,24 +67,34 @@ const PERMISSION_RULES: ReadonlyArray<{ apiPath: string; permission: string }> =
   { apiPath: 'kv.list', permission: 'kv:read' },
   { apiPath: 'workflows.list', permission: 'workflows:read' },
   { apiPath: 'workflows.get', permission: 'workflows:read' },
+  { apiPath: 'workflows.create', permission: 'workflows:create' },
   { apiPath: 'workflows.start', permission: 'workflows:execute' },
   { apiPath: 'workflows.cancel', permission: 'workflows:execute' },
   { apiPath: 'workflows.runs', permission: 'workflows:read' },
   { apiPath: 'schedules.list', permission: 'schedules:read' },
   { apiPath: 'schedules.get', permission: 'schedules:read' },
-  { apiPath: 'schedules.create', permission: 'schedules:write' },
+  { apiPath: 'schedules.create', permission: 'schedules:create' },
   { apiPath: 'schedules.update', permission: 'schedules:write' },
   { apiPath: 'schedules.delete', permission: 'schedules:write' },
+  { apiPath: 'schedules.toggle', permission: 'schedules:write' },
   { apiPath: 'jobs.list', permission: 'jobs:read' },
   { apiPath: 'jobs.get', permission: 'jobs:read' },
+  { apiPath: 'jobs.enqueue', permission: 'jobs:write' },
   { apiPath: 'jobs.cancel', permission: 'jobs:write' },
   { apiPath: 'plugins.list', permission: 'plugins:read' },
   { apiPath: 'plugins.get', permission: 'plugins:read' },
   { apiPath: 'plugins.self', permission: 'plugin:self' },
+  { apiPath: 'plugins.invoke', permission: 'plugins:invoke' },
   { apiPath: 'extensions.registerMenuItem', permission: 'ui:extend' },
   { apiPath: 'extensions.registerCard', permission: 'ui:extend' },
+  { apiPath: 'extensions.register', permission: 'extensions:register' },
+  { apiPath: 'extensions.call', permission: 'extensions:call' },
+  { apiPath: 'ui.registerMenuItem', permission: 'ui:extend' },
   { apiPath: 'ui.notify', permission: 'ui:interact' },
   { apiPath: 'ui.dialog', permission: 'ui:interact' },
+  // ---- NEW: system.processes (for watcher atomic plugins) ----
+  { apiPath: 'processes.query', permission: 'system:process:read' },
+  { apiPath: 'processes.start', permission: 'system:process:start' },
 ];
 
 function permissionRequiredFor(apiPath: string): string | null {
@@ -242,9 +252,11 @@ export function createSandbox(opts: SandboxOptions): SandboxInstance {
   const contextObject = {
     console: safeConsole,
     Buffer: Buffer,
-    // Timers (safe; we restrict to setTimeout/clearTimeout only)
+    // Timers (safe wrappers; restrict to setTimeout/clearTimeout/setInterval/clearInterval)
     setTimeout: (cb: (...a: any[]) => void, ms: number, ...args: any[]) => globalThis.setTimeout(cb, ms, ...args),
     clearTimeout: globalThis.clearTimeout,
+    setInterval: (cb: (...a: any[]) => void, ms: number, ...args: any[]) => globalThis.setInterval(cb, ms, ...args),
+    clearInterval: globalThis.clearInterval,
     // Math / JSON / Date / Symbol / Promise are safe (standard built-ins).
     Math,
     JSON,

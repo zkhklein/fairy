@@ -231,4 +231,71 @@ END;
 CREATE INDEX IF NOT EXISTS idx_workflows_owner ON workflows(owner_plugin_id);
 `,
   },
+  {
+    name: '003_remove_host_plugin.sql',
+    up: /* sql */ `
+-- Migration 003: Remove builtin virtual "com.fmb.host" placeholder plugin.
+-- Requires rebuilding the "workflows" table so owner_plugin_id becomes
+-- nullable (previously NOT NULL via migration 002). NULL owner = workflow
+-- was created by the host directly without an app plugin owner.
+
+PRAGMA foreign_keys = OFF;
+
+-- 1) Rebuild workflows table: drop NOT NULL on owner_plugin_id, keep it TEXT.
+CREATE TABLE IF NOT EXISTS workflows_new (
+  id              TEXT PRIMARY KEY,
+  name            TEXT NOT NULL,
+  description     TEXT DEFAULT '',
+  definition_json TEXT NOT NULL,
+  vars_json       TEXT NOT NULL DEFAULT '{}',
+  owner_plugin_id TEXT,
+  created_at      INTEGER NOT NULL,
+  updated_at      INTEGER NOT NULL
+);
+
+INSERT OR REPLACE INTO workflows_new (id, name, description, definition_json, vars_json, owner_plugin_id, created_at, updated_at)
+SELECT
+  id, name, description, definition_json, vars_json,
+  CASE WHEN owner_plugin_id = '__PENDING_MIGRATE__' THEN NULL ELSE owner_plugin_id END,
+  created_at, updated_at
+FROM workflows;
+
+DROP TABLE IF EXISTS workflows;
+ALTER TABLE workflows_new RENAME TO workflows;
+
+-- 2) Rewrite insert/update triggers to allow NULL owner, still require app type when non-null.
+DROP TRIGGER IF EXISTS trg_workflows_owner_app_insert;
+DROP TRIGGER IF EXISTS trg_workflows_owner_app_update;
+CREATE TRIGGER trg_workflows_owner_app_insert
+BEFORE INSERT ON workflows
+FOR EACH ROW WHEN (
+  NEW.owner_plugin_id IS NOT NULL
+  AND COALESCE((SELECT type FROM plugins WHERE id = NEW.owner_plugin_id), '') != 'app'
+)
+BEGIN
+  SELECT RAISE(ABORT, 'owner_plugin_id must reference a plugin with type=app or be NULL');
+END;
+CREATE TRIGGER trg_workflows_owner_app_update
+BEFORE UPDATE OF owner_plugin_id, id ON workflows
+FOR EACH ROW WHEN (
+  NEW.owner_plugin_id IS NOT NULL
+  AND COALESCE((SELECT type FROM plugins WHERE id = NEW.owner_plugin_id), '') != 'app'
+)
+BEGIN
+  SELECT RAISE(ABORT, 'owner_plugin_id must reference a plugin with type=app or be NULL');
+END;
+
+CREATE INDEX IF NOT EXISTS idx_workflows_owner ON workflows(owner_plugin_id);
+
+-- 3) Orphan any legacy workflows still pointing at the removed host plugin.
+UPDATE workflows SET owner_plugin_id = NULL WHERE owner_plugin_id = 'com.fmb.host';
+
+-- 4) Hard-delete legacy "com.fmb.host" virtual plugin rows (if still present from migration 002).
+DELETE FROM plugin_versions WHERE plugin_id = 'com.fmb.host';
+DELETE FROM plugin_extensions WHERE plugin_id = 'com.fmb.host';
+DELETE FROM plugins WHERE id = 'com.fmb.host';
+
+PRAGMA foreign_keys = ON;
+`,
+  },
 ];

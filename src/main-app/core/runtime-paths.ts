@@ -49,9 +49,25 @@ function defaultLegacyRoot(): string {
  * Compute the candidate portable root. For packaged builds it sits next to
  * the executable; for dev we still use projectRoot/.data to keep things
  * identical to the pre-existing convention.
+ *
+ * electron-builder PORTABLE BUILDS (7z SFX) unpack the whole app into a
+ * temporary %TEMP% directory before launching `Fairy Maid Brigade.exe`.
+ * In that scenario `app.getPath('exe')` points at the TEMP copy and would
+ * write user data into a throwaway location. electron-builder therefore
+ * exports `PORTABLE_EXECUTABLE_DIR` = the directory of the ORIGINAL outer
+ * portable.exe the user actually double-clicked — we MUST use this env var
+ * first (if present & dir exists) to redirect storage into a truly
+ * side-by-side `{exeDir}/fmb-data/`. `PORTABLE_EXECUTABLE_FILE` is also
+ * exported by the same builder and used as a stronger signal that we are
+ * running inside the 7z-SFX sandbox.
  */
 export function resolvePortableRoot(projectRootFallback?: string): string {
   if (app.isPackaged) {
+    const ped = (process.env.PORTABLE_EXECUTABLE_DIR || '').trim();
+    if (ped && fs.existsSync(ped) && fs.statSync(ped).isDirectory()) {
+      return path.join(ped, FMB_PORTABLE_DIR);
+    }
+    // Regular installed build (NSIS) or older portable: exe-adjacent still wins.
     return path.join(path.dirname(app.getPath('exe')), FMB_PORTABLE_DIR);
   }
   const root = projectRootFallback ?? process.cwd();
@@ -232,46 +248,200 @@ export function applyPortablePathsAndMigrate(opts?: { projectRoot?: string }): R
   };
 }
 
-/**
- * Resolution helper for non-Electron consumers (CLI, scripts). Reads the
- * marker file to locate the portable root, otherwise falls back to APPDATA.
- */
-export function resolveRuntimePathsFromMarker(opts?: { projectRoot?: string }): RuntimePathsResult {
-  const tryMarkers: string[] = [];
+// =========================================================================
+// Single-Source-of-Truth helpers — marker candidate order + portable-root
+// resolution from markers. Exported so db / logger / plugin-loader can share
+// the EXACT SAME candidate priority instead of each mirroring their own
+// copy (historical root cause of 3 cross-module path inconsistencies).
+//
+// Candidate priority — ALL modules MUST respect this order:
+//   ① PORTABLE_EXECUTABLE_DIR (electron-builder SFX portable) — HIGHEST
+//   ② process.execPath sibling (packaged CLI / non-SFX portable / NSIS)
+//   ③ projectRoot/.data (explicit dev root)
+//   ④ process.cwd()/.data (dev fallback)
+// =========================================================================
 
-  // 1. Packaged: portable root next to fmb CLI's own .exe / sibling exe dir.
+export interface PortableMarkerCandidate {
+  /** where this candidate came from (used for diagnostics / tests) */
+  kind: 'env' | 'exe' | 'project' | 'cwd';
+  /** absolute path to the .fmb-portable-root marker FILE we try to read */
+  markerPath: string;
+  /** if kind==='env', the env directory so callers can derive fmb-data even w/o marker */
+  envDir?: string;
+}
+
+/**
+ * Build the ordered list of marker-file candidates (SSOT). Never changes the
+ * priority order lightly — electron-builder SFX relies on env being first.
+ */
+export function getPortableMarkerCandidates(opts?: {
+  projectRoot?: string;
+  /** override exe dir — mainly tests, leave undefined for real process.execPath */
+  exeDir?: string;
+  /** override PED env — mainly tests */
+  pedEnv?: string;
+}): PortableMarkerCandidate[] {
+  const out: PortableMarkerCandidate[] = [];
+
+  // ① PORTABLE_EXECUTABLE_DIR (electron-builder SFX portable builds)
+  const pedFinal = (
+    (opts?.pedEnv !== undefined ? opts.pedEnv : process.env.PORTABLE_EXECUTABLE_DIR) || ''
+  ).trim();
+  if (pedFinal) {
+    out.push({
+      kind: 'env',
+      markerPath: path.join(pedFinal, FMB_PORTABLE_DIR, FMB_PORTABLE_MARKER),
+      envDir: pedFinal,
+    });
+  }
+
+  // ② execPath-adjacent (packaged builds — both non-SFX portable and NSIS)
   try {
-    if (process.execPath && process.execPath.includes(FMB_LEGACY_APPDATA_DIR) === false) {
-      tryMarkers.push(path.join(path.dirname(process.execPath), FMB_PORTABLE_DIR, FMB_PORTABLE_MARKER));
+    const exeDir = opts?.exeDir ?? path.dirname(process.execPath);
+    if (exeDir && !exeDir.includes(FMB_LEGACY_APPDATA_DIR)) {
+      out.push({
+        kind: 'exe',
+        markerPath: path.join(exeDir, FMB_PORTABLE_DIR, FMB_PORTABLE_MARKER),
+      });
     }
   } catch { /* noop */ }
 
-  // 2. Explicit project root (dev mode)
+  // ③ explicit projectRoot (dev mode explicit)
   if (opts?.projectRoot) {
-    tryMarkers.push(path.join(opts.projectRoot, '.data', FMB_PORTABLE_MARKER));
+    out.push({
+      kind: 'project',
+      markerPath: path.join(opts.projectRoot, '.data', FMB_PORTABLE_MARKER),
+    });
   }
 
-  // 3. cwd (dev mode fallback)
-  tryMarkers.push(path.join(process.cwd(), '.data', FMB_PORTABLE_MARKER));
+  // ④ cwd (dev fallback)
+  try {
+    out.push({
+      kind: 'cwd',
+      markerPath: path.join(process.cwd(), '.data', FMB_PORTABLE_MARKER),
+    });
+  } catch { /* noop */ }
 
-  for (const markerPath of tryMarkers) {
-    if (!fs.existsSync(markerPath)) continue;
-    try {
-      const marker = JSON.parse(fs.readFileSync(markerPath, 'utf8')) as { portableRoot?: string };
-      if (marker.portableRoot) {
-        const root = marker.portableRoot;
-        return {
-          mode: 'portable',
-          portableRoot: root,
-          userData: path.join(root, 'userData'),
-          logs: path.join(root, 'logs'),
-          plugins: path.join(root, 'plugins'),
-          cache: path.join(root, 'cache'),
-          sessionData: path.join(root, 'sessionData'),
-          userCache: path.join(root, 'userCache'),
-        };
+  return out;
+}
+
+/**
+ * Try to read a portable root out of the SSOT candidate list.
+ *
+ * Behaviour — SFX-FIRST resolution:
+ *   1. ENV (PORTABLE_EXECUTABLE_DIR) is a STRONG signal from electron-builder:
+ *      "you were launched as a 7z SFX portable, outer exe lives here". If the
+ *      corresponding envDir EXISTS and is a real directory:
+ *        a. If {PED}/fmb-data/.fmb-portable-root marker exists and has a valid
+ *           `portableRoot` string → return it.
+ *        b. Else if `autoPortableOnEnvWritable === true` and
+ *           `{PED}/fmb-data` is writable (mkdir allowed) → return
+ *           `{PED}/fmb-data` WITHOUT requiring a marker. This is the "first
+ *           SFX boot creates the portable tree on demand" behaviour the user
+ *           asked for. DOWNSTREAM (db init / logger init / plugin loader init)
+ *           all do mkdir -p on their subpaths, so the full tree auto-creates.
+ *        c. If envDir is real but dir is NOT writable (e.g. CD-ROM / read-only
+ *           USB) → fall through, honouring the rest of the candidate chain
+ *           and eventually APPDATA legacy.
+ *   2. If the env STRONG signal was absent / unreal OR failed to lock, try
+ *      every remaining candidate marker; the FIRST one whose marker file
+ *      EXISTS and contains a valid `portableRoot` string wins.
+ *   3. If STILL nothing resolved → return null (caller falls back to APPDATA
+ *      legacy).
+ *
+ * ENV IS NEVER PREEMPTED by a later candidate. This is critical: a developer
+ * running an SFX Portable from inside their dev repo (or any dir that happens
+ * to contain `./.data/.fmb-portable-root`) should still anchor data NEXT TO
+ * the outer SFX executable, not back inside the dev repo. Historically this
+ * was the #1 cause of portable data writing to the wrong place.
+ */
+export function resolvePortableRootFromMarkers(opts?: {
+  projectRoot?: string;
+  exeDir?: string;
+  pedEnv?: string;
+  autoPortableOnEnvWritable?: boolean;
+}): string | null {
+  const candidates = getPortableMarkerCandidates(opts);
+  const envCand = candidates.find((c) => c.kind === 'env');
+
+  // ── Phase 1: SFX strong signal ──────────────────────────────────────────
+  if (envCand && envCand.envDir) {
+    const pedReal =
+      fs.existsSync(envCand.envDir) && fs.statSync(envCand.envDir).isDirectory();
+    if (pedReal) {
+      const fmb = path.join(envCand.envDir, FMB_PORTABLE_DIR);
+      // (1a) env marker exists and is valid → locked on env
+      if (fs.existsSync(envCand.markerPath)) {
+        try {
+          const marker = JSON.parse(
+            fs.readFileSync(envCand.markerPath, 'utf8'),
+          ) as { portableRoot?: string };
+          if (marker.portableRoot && typeof marker.portableRoot === 'string') {
+            return marker.portableRoot;
+          }
+        } catch {
+          /* corrupted env marker — fall through to (1b) auto-portable */
+        }
       }
-    } catch { /* corrupted marker; skip */ }
+      // (1b) no valid env marker yet → first SFX boot, auto-lock if writable
+      if (opts?.autoPortableOnEnvWritable && isDirWritable(fmb)) {
+        return path.resolve(fmb);
+      }
+      // (1c) env is real but not writable (read-only media) → fallthrough to
+      // normal candidate chain so exe / cwd APPDATA can still win.
+    }
+  }
+
+  // ── Phase 2: remaining candidates (exe / project / cwd) by marker ───────
+  for (const c of candidates) {
+    if (c.kind === 'env') continue; // handled in Phase 1 above
+    if (!fs.existsSync(c.markerPath)) continue;
+    try {
+      const marker = JSON.parse(
+        fs.readFileSync(c.markerPath, 'utf8'),
+      ) as { portableRoot?: string };
+      if (marker.portableRoot && typeof marker.portableRoot === 'string') {
+        return marker.portableRoot;
+      }
+    } catch {
+      /* corrupted; try next candidate */
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Resolution helper for non-Electron consumers (CLI, scripts). Reads the
+ * marker file to locate the portable root, otherwise falls back to APPDATA.
+ *
+ * SFX FIRST BOOT: when PORTABLE_EXECUTABLE_DIR exists and
+ * {PED}/fmb-data is writable, this returns portable mode anchored at
+ * {PED}/fmb-data EVEN WHEN no marker file is present yet. This ensures the
+ * CLI (which may run after the main Electron app has finished
+ * applyPortablePathsAndMigrate but BEFORE the marker was flushed to disk,
+ * or during the very first SFX boot where the user hasn't created any data
+ * yet) resolves to the correct side-by-side directory. Downstream callers
+ * (db init / logger init / plugin loader init) all do mkdir -p on their
+ * subpaths, so the D:\BOAT\FAIRY\portable\fmb-data tree auto-creates on
+ * first use regardless of whether a marker file exists.
+ */
+export function resolveRuntimePathsFromMarker(opts?: { projectRoot?: string }): RuntimePathsResult {
+  const root = resolvePortableRootFromMarkers({
+    projectRoot: opts?.projectRoot,
+    autoPortableOnEnvWritable: true,
+  });
+  if (root) {
+    return {
+      mode: 'portable',
+      portableRoot: root,
+      userData: path.join(root, 'userData'),
+      logs: path.join(root, 'logs'),
+      plugins: path.join(root, 'plugins'),
+      cache: path.join(root, 'cache'),
+      sessionData: path.join(root, 'sessionData'),
+      userCache: path.join(root, 'userCache'),
+    };
   }
 
   const legacy = defaultLegacyRoot();

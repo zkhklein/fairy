@@ -19,10 +19,10 @@ import { createLogger } from '../logger';
 import type { EventBusService } from '../event-bus';
 import { getEventBus } from '../event-bus';
 import { getRawDb } from '../db';
+import { resolvePortableRootFromMarkers } from '../runtime-paths';
 
 import type { PluginManifest, PluginType, ProblemDetails, HostApi } from '@shared/index';
 import { PluginManifestSchema, toProblemDetails } from '@shared/index';
-import { FMB_BUILTIN_HOST_PLUGIN_ID, FMB_BUILTIN_HOST_PLUGIN_NAME } from '@shared/project';
 import { readManifestFromDir } from './manifest';
 import { createSandbox, PermissionDeniedError, createPermissionedHostApi } from './sandbox';
 import { buildHostApi, type HostApiServices } from './host-api';
@@ -70,6 +70,11 @@ export class PluginService {
     start?: HostApiServices['onStartWorkflow'];
     get?: HostApiServices['onGetWorkflow'];
   } = {};
+  // Similarly for SchedulerService callbacks: create/toggle schedules.
+  private scheduleCallbacks: {
+    create?: HostApiServices['onCreateSchedule'];
+    toggle?: HostApiServices['onToggleSchedule'];
+  } = {};
 
   setWorkflowCallbacks(cb: {
     create?: HostApiServices['onCreateWorkflow'];
@@ -79,31 +84,26 @@ export class PluginService {
     this.workflowCallbacks = { ...this.workflowCallbacks, ...cb };
   }
 
+  setScheduleCallbacks(cb: {
+    create?: HostApiServices['onCreateSchedule'];
+    toggle?: HostApiServices['onToggleSchedule'];
+  }): void {
+    this.scheduleCallbacks = { ...this.scheduleCallbacks, ...cb };
+  }
+
   constructor(opts?: { pluginsRoot?: string; eventBus?: EventBusService }) {
     this.bus = opts?.eventBus ?? getEventBus();
     try {
       if (opts?.pluginsRoot) {
         this.pluginsRoot = opts.pluginsRoot;
       } else {
-        // --- Marker-first: resolve the portable root directly from the marker
-        // file, placed there by applyPortablePathsAndMigrate(). Works even if
-        // ESM hoisting delayed the bootstrap past app.isReady() so
-        // electronApp.setPath didn't reroute userData.
+        // --- Marker-first (plus SFX env-writable auto-portable) resolution
+        // via SSOT in runtime-paths. Works even if ESM hoisting delayed the
+        // bootstrap past app.isReady() so electronApp.setPath didn't reroute
+        // userData.
         let portableRoot: string | undefined;
         try {
-          const portableDir = 'fmb-data';
-          const markerName = '.fmb-portable-root';
-          const candidateMarkers: string[] = [];
-          try {
-            candidateMarkers.push(path.join(path.dirname(electronApp.getPath('exe')), portableDir, markerName));
-          } catch { /* noop */ }
-          candidateMarkers.push(path.join(process.cwd(), '.data', markerName));
-          for (const mp of candidateMarkers) {
-            if (fs.existsSync(mp)) {
-              const m = JSON.parse(fs.readFileSync(mp, 'utf8')) as { portableRoot?: string };
-              if (m.portableRoot) { portableRoot = m.portableRoot; break; }
-            }
-          }
+          portableRoot = resolvePortableRootFromMarkers({ autoPortableOnEnvWritable: true }) ?? undefined;
         } catch { /* noop */ }
         if (portableRoot) {
           this.pluginsRoot = path.join(portableRoot, 'plugins');
@@ -124,114 +124,225 @@ export class PluginService {
       this.pluginsRoot = opts?.pluginsRoot ?? path.resolve(process.cwd(), '.data', 'plugins');
     }
     fs.mkdirSync(this.pluginsRoot, { recursive: true });
-    this.ensureBuiltinHostPlugin();
+    // Bootstrap rescan: (1) registers any plugins already on disk into SQLite (status='installed'
+    // by default — the portable copy-paste behaviour), (2) marks plugins that have disappeared
+    // from disk as 'disabled'. Runs at boot so a user that drops / removes plugins between runs
+    // sees the correct state on first paint. Non-blocking: at this exact moment loadedInstances
+    // is empty so pruneMissing does almost no I/O; the sideload is sync-only.
+    void this.rescan().catch((e) => log.error({ err: String(e?.stack ?? e) }, 'constructor rescan failed'));
   }
 
   /**
-   * com.fmb.host is a virtual built-in app plugin used as the default owner
-   * for workflows that pre-date the mandatory owner_plugin_id FK (migration
-   * 002). The migration inserts a row into `plugins` but does NOT write the
-   * corresponding `plugin_versions` row nor the on-disk plugin directory, so
-   * `enablePlugin()` would otherwise fail with "not on disk".
+   * Scan `pluginsRoot` for any `<id>@<version>/` directories that contain a
+   * valid `manifest.json` matching the folder name, and register them into
+   * the SQLite registry if they are missing. This enables the portable
+   * "copy plugins folder and it just shows up" behaviour.
    *
-   * This method is idempotent: it UPSERTs the plugins row, INSERT OR IGNOREs
-   * the plugin_versions row, and (re)writes manifest.json + index.js on
-   * disk so subsequent enable() calls find a real, loadable plugin.
+   * Idempotent: plugins already in DB are NOT demoted in status. The version
+   * row is INSERT OR IGNORE so repeated boots are cheap.
+   *
+   * @returns number of plugins freshly registered into `plugins` table this
+   *          call (useful for TDD assertions).
    */
-  private ensureBuiltinHostPlugin(): void {
-    const version = '0.1.0';
-    const pluginId = FMB_BUILTIN_HOST_PLUGIN_ID;
-    const targetDir = path.join(this.pluginsRoot, `${pluginId}@${version}`);
-    const manifest: PluginManifest = {
-      id: pluginId,
-      name: FMB_BUILTIN_HOST_PLUGIN_NAME,
-      version,
-      type: 'app',
-      description:
-        'Built-in owner plugin for legacy workflows and host-side bootstrapping. No-op activate, no renderer sub-page.',
-      permissions: [],
-      dependencies: {},
-      main: 'index.js',
-      extensionPoints: [],
-    };
-
+  sideloadFromDisk(): number {
+    let registered = 0;
     try {
-      // 1) On-disk artifacts (idempotent: overwrite each boot so stale
-      // manifests don't drift).
-      fs.mkdirSync(targetDir, { recursive: true });
-      fs.writeFileSync(path.join(targetDir, 'manifest.json'), JSON.stringify(manifest, null, 2));
-      if (!fs.existsSync(path.join(targetDir, manifest.main))) {
-        fs.writeFileSync(
-          path.join(targetDir, manifest.main),
-          [
-            '// Built-in virtual owner plugin for legacy workflows (auto-generated).',
-            '// This plugin is intentionally minimal: no activate side-effects, no renderer.',
-            'module.exports = {',
-            '  activate() {},',
-            '  deactivate() {},',
-            '};',
-            '',
-          ].join('\n'),
-        );
-      }
+      const dirs = fs.readdirSync(this.pluginsRoot, { withFileTypes: true });
+      for (const d of dirs) {
+        if (!d.isDirectory()) continue;
+        // Skip internal/hidden folders: .tmp-* extract scratch, .DS_Store,
+        // any dot-name dirs.
+        if (d.name.startsWith('.')) continue;
+        const match = /^(.+)@([^@]+)$/.exec(d.name);
+        if (!match) continue;
+        const [, dirId, dirVersion] = match;
+        const fullDir = path.join(this.pluginsRoot, d.name);
+        const parsed = readManifestFromDir(fullDir, { instance: `sideload:${d.name}` });
+        if (!parsed.ok) {
+          log.warn({ dir: fullDir, detail: parsed.error }, `sideload: skipping ${d.name} (bad manifest)`);
+          continue;
+        }
+        const m = parsed.manifest;
+        if (m.id !== dirId || m.version !== dirVersion) {
+          log.warn(
+            { dir: fullDir, manifestId: m.id, manifestVersion: m.version, dirId, dirVersion },
+            `sideload: skipping ${d.name} (manifest id/version do not match directory name)`,
+          );
+          continue;
+        }
 
-      const now = Date.now();
-      const permissionsJson = JSON.stringify(manifest.permissions ?? []);
-      const depsJson = JSON.stringify(manifest.dependencies ?? {});
-      const manifestJson = JSON.stringify(manifest);
+        const existing = this.get(m.id);
+        const now = Date.now();
+        const perm = JSON.stringify(m.permissions ?? []);
+        const deps = JSON.stringify(m.dependencies ?? {});
+        const man = JSON.stringify(m);
 
-      // 2) UPSERT plugins table row (keeps installed_at if already present).
-      const existing = this.get(pluginId);
-      if (!existing) {
-        this.raw()
-          .prepare(
-            `INSERT INTO plugins (id,name,type,description,current_version,status,permissions_json,dependencies_json,manifest_json,installed_at,updated_at)
-             VALUES (@id,@name,@type,@desc,@version,'installed',@perm,@deps,@man,@t,@t)`,
-          )
-          .run({
-            id: pluginId,
-            name: manifest.name,
-            type: manifest.type,
-            desc: manifest.description ?? '',
-            version,
-            perm: permissionsJson,
-            deps: depsJson,
-            man: manifestJson,
-            t: now,
-          });
-      } else {
-        this.raw()
-          .prepare(
-            `UPDATE plugins SET name=@name, type=@type, description=@desc, current_version=@version,
-                    permissions_json=@perm, dependencies_json=@deps, manifest_json=@man, updated_at=@t
-              WHERE id=@id`,
-          )
-          .run({
-            id: pluginId,
-            name: manifest.name,
-            type: manifest.type,
-            desc: manifest.description ?? '',
-            version,
-            perm: permissionsJson,
-            deps: depsJson,
-            man: manifestJson,
-            t: now,
-          });
-      }
+        if (!existing) {
+          // ── Fresh sideload: register a new plugins row (disabled by default via status='installed') ──
+          this.raw()
+            .prepare(
+              `INSERT INTO plugins (id,name,type,description,current_version,status,permissions_json,dependencies_json,manifest_json,installed_at,updated_at)
+               VALUES (@id,@name,@type,@desc,@version,'installed',@perm,@deps,@man,@t,@t)`,
+            )
+            .run({
+              id: m.id,
+              name: m.name,
+              type: m.type,
+              desc: m.description || '',
+              version: m.version,
+              perm,
+              deps,
+              man,
+              t: now,
+            });
+          registered++;
+          void this.bus
+            .safeEmit(
+              'plugin.afterInstall',
+              {
+                plugin: {
+                  id: m.id,
+                  name: m.name,
+                  type: m.type,
+                  description: m.description || '',
+                  current_version: m.version,
+                  status: 'installed',
+                  permissions_json: perm,
+                  dependencies_json: deps,
+                  manifest_json: man,
+                  installed_at: now,
+                  updated_at: now,
+                },
+                pluginVersion: {
+                  plugin_id: m.id,
+                  version: m.version,
+                  directory: fullDir,
+                  installed_at: now,
+                },
+              },
+              { source: 'plugin.service.sideload' },
+            )
+            .catch(() => {});
+        } else {
+          // ── Already registered: sync manifest + promote current_version only,
+          //    NEVER touch status.
+          const cur: string | undefined = existing.current_version;
+          const promote =
+            !cur ||
+            (semver.valid(cur) && semver.valid(m.version) && semver.gt(m.version, cur));
+          this.raw()
+            .prepare(
+              `UPDATE plugins SET name=@name,type=@type,description=@desc,permissions_json=@perm,dependencies_json=@deps,manifest_json=@man,updated_at=@t` +
+                (promote ? `,current_version=@newver` : ``) +
+                ` WHERE id=@id`,
+            )
+            .run({
+              id: m.id,
+              name: m.name,
+              type: m.type,
+              desc: m.description || '',
+              perm,
+              deps,
+              man,
+              t: now,
+              newver: m.version,
+            });
+        }
 
-      // 3) plugin_versions INSERT OR IGNORE (primary key = plugin_id+version).
-      try {
-        this.raw()
-          .prepare(
-            `INSERT OR IGNORE INTO plugin_versions (plugin_id,version,directory,installed_at) VALUES (?,?,?,?)`,
-          )
-          .run(pluginId, version, targetDir, existing?.installed_at ?? now);
-      } catch (e: any) {
-        if (!String(e?.message ?? '').includes('UNIQUE')) throw e;
+        // plugin_versions always track (INSERT OR IGNORE — PK = plugin_id+version).
+        try {
+          this.raw()
+            .prepare(
+              `INSERT OR IGNORE INTO plugin_versions (plugin_id,version,directory,installed_at) VALUES (?,?,?,?)`,
+            )
+            .run(m.id, m.version, fullDir, existing?.installed_at ?? now);
+        } catch (e: any) {
+          if (!String(e?.message || '').includes('UNIQUE')) throw e;
+        }
       }
     } catch (e: any) {
-      log.error({ err: String(e?.stack ?? e) }, `ensureBuiltinHostPlugin(${pluginId}) failed — enable will be unavailable`);
+      log.error({ err: String(e?.stack ?? e) }, 'sideloadFromDisk failed');
     }
+    return registered;
+  }
+
+  /**
+   * Combine "add new plugins on disk" + "mark missing plugins as disabled" into one
+   * high-level rescan. This is the single entry point that both the constructor
+   * (boot reconciliation) and `list()` (Refresh button in Plugins page) call so
+   * every list refresh picks up newly dropped plugins and drops references to
+   * plugins the user has just deleted from disk.
+   *
+   * @returns stats useful for TDD and logging.
+   */
+  async rescan(): Promise<{ newlyInstalled: number; newlyDisabled: number }> {
+    const newlyInstalled = this.sideloadFromDisk();
+    const newlyDisabled = await this.pruneMissing();
+    if (newlyInstalled > 0 || newlyDisabled > 0) {
+      log.info({ newlyInstalled, newlyDisabled }, 'plugin rescan complete');
+    }
+    return { newlyInstalled, newlyDisabled };
+  }
+
+  /**
+   * For each non-builtin plugin in SQLite, verify that the version folder
+   * (`{pluginsRoot}/{id}@{current_version}/`) is still present on disk and has
+   * a readable `manifest.json`. If not:
+   *   - if status='enabled' → call `disablePlugin()` so the sandbox is torn
+   *     down (call it "退出插件" from the user's perspective)
+   *   - always SET status='disabled' in the DB so the UI paints a clear state
+   *     ("插件文件缺失")
+   *   - DB row is NEVER deleted here — workflows reference owner_plugin_id
+   *     and a user might have just moved the folder temporarily.
+   */
+  private async pruneMissing(): Promise<number> {
+    let newlyDisabled = 0;
+    try {
+      type Row = { id: string; status: 'installed' | 'enabled' | 'disabled'; current_version: string };
+      const rows = this.raw()
+        .prepare(`SELECT id, status, current_version FROM plugins`)
+        .all() as Row[];
+
+      for (const row of rows) {
+        if (!row.current_version) continue;
+        const expectedDir = path.join(this.pluginsRoot, `${row.id}@${row.current_version}`);
+        const manifestOk =
+          fs.existsSync(expectedDir) &&
+          fs.existsSync(path.join(expectedDir, 'manifest.json'));
+        if (manifestOk) continue;
+
+        // Plugin vanished from disk.
+        if (row.status === 'enabled') {
+          try {
+            log.info({ id: row.id, expectedDir }, `rescan: plugin missing on disk, auto-disabling (退出插件)`);
+            await this.disablePlugin(row.id);
+          } catch (e: any) {
+            log.warn(
+              { err: String(e?.stack ?? e), id: row.id },
+              `rescan: disablePlugin() failed for missing plugin; forcing DB status anyway`,
+            );
+          }
+        }
+        if (row.status !== 'disabled') {
+          this.raw()
+            .prepare(`UPDATE plugins SET status = 'disabled', updated_at = ? WHERE id = ?`)
+            .run(Date.now(), row.id);
+          void this.bus.safeEmit(
+            'plugin.statusChanged',
+            { pluginId: row.id, from: row.status, to: 'disabled', reason: 'missing-on-disk' },
+            { source: 'plugin.service.rescan' },
+          );
+          newlyDisabled++;
+        } else if (this.loadedInstances.has(row.id)) {
+          // safety: DB already said 'disabled' but instance still loaded (shouldn't happen,
+          // but instance may have loaded via direct enable between our SELECT and now).
+          try { await this.disablePlugin(row.id); } catch { /* best-effort */ }
+        }
+      }
+    } catch (e: any) {
+      log.error({ err: String(e?.stack ?? e) }, 'pruneMissing failed');
+    }
+    return newlyDisabled;
   }
 
   get root(): string { return this.pluginsRoot; }
@@ -239,7 +350,11 @@ export class PluginService {
   // ---------------- raw DB helpers (sync) ----------------
   private raw() { return getRawDb(); }
 
-  list(q: { page?: number; pageSize?: number; status?: string; type?: string; q?: string } = {}): { total: number; page: number; pageSize: number; items: any[] } {
+  async list(q: { page?: number; pageSize?: number; status?: string; type?: string; q?: string } = {}): Promise<{ total: number; page: number; pageSize: number; items: any[] }> {
+    // Plugin management page "Refresh" button calls main_plugin_list → this.list().
+    // Always reconcile with disk first so newly dropped plugins show up and plugins
+    // the user just deleted from pluginsRoot are exited (disabled).
+    await this.rescan();
     const sql = `SELECT * FROM plugins WHERE 1=1` +
       (q.status ? ` AND status = @status` : ``) +
       (q.type ? ` AND type = @type` : ``) +
@@ -444,6 +559,8 @@ export class PluginService {
       onCreateWorkflow: (a) => this.workflowCallbacks.create?.(a) ?? {},
       onStartWorkflow: (id, input) => Promise.resolve(this.workflowCallbacks.start?.(id, input) ?? { runId: '', status: 'pending' }),
       onGetWorkflow: (id) => this.workflowCallbacks.get?.(id) ?? null,
+      onCreateSchedule: (a) => this.scheduleCallbacks.create?.(a) ?? {},
+      onToggleSchedule: (id, enabled) => this.scheduleCallbacks.toggle?.(id, enabled) ?? null,
       onAudit: (a) => {
         try {
           // audit_logs.source CHECK IN ('ui','cli','http','system','plugin'); use just 'plugin'
@@ -477,19 +594,37 @@ export class PluginService {
       onKvGet: (key, global) => {
         const f = global ? path.join(this.pluginsRoot, '.fmb-kv-global.json') : path.join(pvRow.directory, '.fmb-kv.json');
         if (!fs.existsSync(f)) return null;
-        try { return JSON.parse(fs.readFileSync(f, 'utf8'))[key] ?? null; } catch { return null; }
+        try {
+          // Strip a leading UTF-8 BOM if present (PowerShell's Set-Content -Encoding UTF8
+          // writes one; Node's JSON.parse rejects a leading U+FEFF on string input).
+          const raw = fs.readFileSync(f, 'utf8').replace(/^\uFEFF/, '');
+          return JSON.parse(raw)[key] ?? null;
+        } catch { return null; }
       },
       onKvSet: (key, value, global) => {
         const f = global ? path.join(this.pluginsRoot, '.fmb-kv-global.json') : path.join(pvRow.directory, '.fmb-kv.json');
-        const obj = fs.existsSync(f) ? JSON.parse(fs.readFileSync(f, 'utf8')) : {};
+        let obj = {} as Record<string, unknown>;
+        if (fs.existsSync(f)) {
+          try {
+            const raw = fs.readFileSync(f, 'utf8').replace(/^\uFEFF/, '');
+            obj = JSON.parse(raw);
+          } catch { obj = {}; }
+        }
         obj[key] = value;
+        // Write WITHOUT BOM (fs.writeFileSync with 'utf8' on Node never writes one;
+        // explicitly enforce consistency so round-trips through PowerShell stay clean).
         fs.writeFileSync(f, JSON.stringify(obj, null, 2), 'utf8');
         return true;
       },
       onKvDelete: (key, global) => {
         const f = global ? path.join(this.pluginsRoot, '.fmb-kv-global.json') : path.join(pvRow.directory, '.fmb-kv.json');
         if (!fs.existsSync(f)) return true;
-        const obj = JSON.parse(fs.readFileSync(f, 'utf8')); delete obj[key];
+        let obj = {} as Record<string, unknown>;
+        try {
+          const raw = fs.readFileSync(f, 'utf8').replace(/^\uFEFF/, '');
+          obj = JSON.parse(raw);
+        } catch { obj = {}; }
+        delete obj[key];
         fs.writeFileSync(f, JSON.stringify(obj, null, 2), 'utf8');
         return true;
       },
@@ -512,7 +647,24 @@ export class PluginService {
       });
       sandbox = createSandbox({
         manifest, sourceCode, filename: mainPath, hostApi,
-        globals: {},
+        globals: {
+          /**
+           * White-listed environment variables provided by the host so plugins
+           * can compute Windows install paths (e.g. Trae.exe / ChatGPT.exe
+           * default install dirs) without leaking the real `process` object
+           * into the sandbox (which would defeat isolation).
+           *
+           * Plugins read this as: `var env = (typeof __hostEnv === 'object' && __hostEnv) || null`.
+           * Values are empty strings if undefined on the host (so string ops work).
+           */
+          __hostEnv: {
+            LOCALAPPDATA: process.env.LOCALAPPDATA || '',
+            PROGRAMFILES: process.env['ProgramFiles'] || '',
+            'PROGRAMFILES(X86)': process.env['ProgramFiles(x86)'] || '',
+            PROGRAMW6432: process.env['ProgramW6432'] || '',
+            HOME: process.env.HOME || process.env.USERPROFILE || '',
+          },
+        },
         onPermissionDenied: onPermDenied,
       });
     } catch (e) {

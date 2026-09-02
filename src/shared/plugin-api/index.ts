@@ -141,6 +141,39 @@ export const HostScheduleToggle = method(
   z.object({ ok: z.literal(true) }),
 );
 
+// ============ System / Processes (new for watcher plugins) ============
+export const HostProcessesQuery = method(
+  z.object({
+    /** Process image names (case-insensitive, .exe suffix optional). */
+    processNames: z.array(z.string().min(1)).min(1),
+  }),
+  /** Returns { [processNameAsGiven]: isRunning } so callers can map directly. */
+  z.record(z.string(), z.boolean()),
+);
+export const HostProcessesStart = method(
+  z.object({
+    /** Absolute path of the executable to start. */
+    executablePath: z.string().min(1),
+    /** Optional CLI arguments. */
+    args: z.array(z.string()).default([]),
+    /** Optional working directory (default: executable dir). */
+    cwd: z.string().optional(),
+    /**
+     * Defaults true: start detached so the launched program survives
+     * FMB restarts / plugin disable. Exactly what a watcher wants when
+     * "don't disturb the running software — only restart if exited".
+     */
+    detached: z.boolean().default(true),
+    /** Seconds to wait for successful spawn + optional PID before timing out. */
+    timeoutMs: z.number().int().positive().default(30_000),
+  }),
+  z.object({
+    pid: z.number().int().positive(),
+    spawnedAtMs: z.number().int().nonnegative(),
+    alreadyRunning: z.boolean().default(false),
+  }),
+);
+
 // ============ Job queue ============
 export const HostJobEnqueue = method(
   z.object({
@@ -159,6 +192,26 @@ export const HostPluginSelf = method(z.object({}), PluginManifestSchema.extend({
 export const HostPluginList = method(
   z.object({ type: PluginType.optional(), status: PluginStatus.optional() }),
   z.array(PluginManifestSchema.extend({ status: PluginStatus, installedAt: z.number() })),
+);
+/**
+ * Cross-plugin direct invocation: ask the host to call `pluginId`'s exported
+ * `method` with `payload` and return its value.
+ *
+ * Used instead of extensions.call when:
+ *   - You already know the target plugin id (watchdog knows its atomic deps).
+ *   - You need return values back (this is the main reliable way to get them).
+ *   - You want to avoid event-bus registration / wildcard-matching bugs.
+ *
+ * Requires target plugin to be status=enabled and `method` to be a non-special
+ * exported function (i.e. NOT named `activate` / `deactivate`).
+ */
+export const HostPluginInvoke = method(
+  z.object({
+    pluginId: z.string().min(1),
+    method: z.string().min(1),
+    payload: z.any().optional(),
+  }),
+  z.any(),
 );
 
 // ============ Extension points ============
@@ -210,8 +263,8 @@ export interface HostApi {
     get(id: string): Promise<z.infer<typeof WorkflowSchema> | null>;
   };
   schedules: {
-    create(args: { name: string; cron?: string; oneShotAtMs?: number; workflowId: string; input?: Record<string, unknown> }): Promise<{ id: string }>;
-    toggle(id: string, enabled: boolean): Promise<{ ok: true }>;
+    create(args: { id?: string; name: string; cron?: string; oneShotAtMs?: number; workflowId: string; input?: Record<string, unknown>; enabled?: boolean }): Promise<{ id: string; enabled: boolean }>;
+    toggle(id: string, enabled: boolean): Promise<{ ok: true; id: string; enabled: boolean } | null>;
   };
   jobs: {
     enqueue(args: { type: z.infer<typeof JobType>; payload: Record<string, unknown>; priority?: number; runAfterMs?: number }): Promise<{ id?: number; status: z.infer<typeof JobStatus> }>;
@@ -221,6 +274,8 @@ export interface HostApi {
   plugins: {
     self(): Promise<z.infer<typeof PluginManifestSchema> & { status: z.infer<typeof PluginStatus> }>;
     list(args?: { type?: z.infer<typeof PluginType>; status?: z.infer<typeof PluginStatus> }): Promise<Array<z.infer<typeof PluginManifestSchema> & { status: z.infer<typeof PluginStatus>; installedAt: number }>>;
+    /** Direct cross-plugin call: invoke `method` on plugin `pluginId`'s exports with payload, return the handler's return value. Target plugin MUST be status=enabled and method MUST be a public exported function (not activate/deactivate). */
+    invoke<TResult = unknown>(args: { pluginId: string; method: string; payload?: unknown }): Promise<TResult>;
   };
   extensions: {
     register(point: string, handlerName: string): Promise<{ id?: number }>;
@@ -228,6 +283,16 @@ export interface HostApi {
   };
   ui: {
     registerMenuItem(args: { path: string; label: string; icon?: string }): Promise<{ id: string }>;
+  };
+  processes: {
+    /** Check whether each of the given process names is currently running (Win tasklist / ps on unix). */
+    query(args: z.infer<typeof HostProcessesQuery.params>): Promise<z.infer<typeof HostProcessesQuery.result>>;
+    /**
+     * Start a program detached (default). Safe for watchers: never kills a
+     * running instance of the target — only spawns if not already running
+     * when `args.skipIfRunning` (implementation handles that inside start()).
+     */
+    start(args: z.infer<typeof HostProcessesStart.params>): Promise<z.infer<typeof HostProcessesStart.result>>;
   };
 }
 
@@ -244,9 +309,10 @@ export const HostContracts = {
   workflows: { create: HostWorkflowCreate, start: HostWorkflowStart, get: HostWorkflowGet },
   schedules: { create: HostScheduleCreate, toggle: HostScheduleToggle },
   jobs: { enqueue: HostJobEnqueue, get: HostJobGet, cancel: HostJobCancel },
-  plugins: { self: HostPluginSelf, list: HostPluginList },
+  plugins: { self: HostPluginSelf, list: HostPluginList, invoke: HostPluginInvoke },
   extensions: { register: HostRegisterExtension, call: HostCallExtension },
   ui: { registerMenuItem: HostUiRegisterMenuItem },
+  processes: { query: HostProcessesQuery, start: HostProcessesStart },
 } as const;
 
 /** Plugin registration helpers (passed into entry point). */

@@ -88,3 +88,21 @@ dist*/
 
 # pnpm/npm download cache
 .npm-cache/
+
+# TDD build artifacts (esbuild bundles, temp snippets, shims)
+scripts/__tdd_*
+scripts/__fmb*
+scripts/_build-ownership-*
+scripts/build-*.log
+
+# Temp scratch files
+.tdd-*.txt
+.tmp_*
+_e2e_final.js
+.asar-unpacked/
+
+# Trae spec/plan documents (local planning, not source)
+.trae/
+
+# Utility one-off scripts
+scripts/_open-draft-pr.cjs

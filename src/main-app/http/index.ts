@@ -157,9 +157,11 @@ export function startHttpServer(opts: { bootTs: number }): HttpServerHandle | nu
   app.get('/api/v1/docs', swaggerUI({ url: '/api/v1/openapi.json' }));
 
   // ---- plugins ----
-  app.get('/api/v1/plugins', (c) => {
+  // Handler MUST be async: getPluginService().list() now does disk I/O (rescan) to pick up
+  // newly dropped / removed plugins, matching the Plugins page "Refresh" button behaviour.
+  app.get('/api/v1/plugins', async (c) => {
     const p = pluginListParams(c);
-    return c.json(getPluginService().list(p));
+    return c.json(await getPluginService().list(p));
   });
 
   app.post('/api/v1/plugins', async (c) => {
@@ -234,6 +236,23 @@ export function startHttpServer(opts: { bootTs: number }): HttpServerHandle | nu
       return problem(c, 400, 'Bad Request', `unknown action ${action}`);
     }
     return c.json(getPluginService().get(id));
+  });
+
+  // Invoke a named export on an installed+enabled plugin (sandboxed
+  // callAction — same entry the AppPluginPage HostUIApi.callPluginMainAction
+  // uses for renderer → main action dispatch; Bearer token gated).
+  app.post('/api/v1/plugins/:id/invoke', async (c) => {
+    const id = c.req.param('id');
+    const body = await c.req.json().catch(() => ({})) as { action?: string; payload?: unknown };
+    if (typeof body.action !== 'string' || !body.action) {
+      return problem(c, 400, 'Bad Request', 'action (string) required in body');
+    }
+    const got = getPluginService().get(id);
+    if (!got) return problem(c, 404, 'Not Found', 'plugin not found');
+    if (got.status !== 'enabled') return problem(c, 409, 'Plugin Disabled', `plugin ${id} is ${got.status}; invoke requires enabled`);
+    const r = await getPluginService().callAction(id, body.action, body.payload ?? null);
+    audit({ action: 'http.plugin.invoke', source: 'http', actor: 'http', payload: { id, action: body.action, size: JSON.stringify(body.payload ?? null).length }, traceId: newTraceId() });
+    return c.json(r as any, r.ok ? 200 : 422);
   });
 
   // ---- workflows ----
@@ -507,7 +526,7 @@ async function rpcDispatch(r: any): Promise<unknown> {
         return { jsonrpc: '2.0', id, result: { version: electronApp.getVersion(), activeRuns, dbOk: true } };
       }
       case 'plugin.list':
-        return { jsonrpc: '2.0', id, result: getPluginService().list({ page: 1, pageSize: 20 }) };
+        return { jsonrpc: '2.0', id, result: await getPluginService().list({ page: 1, pageSize: 20 }) };
       case 'workflow.list':
         return { jsonrpc: '2.0', id, result: getWorkflowService().list({ page: 1, pageSize: 20 }) };
       case 'workflow.run': {

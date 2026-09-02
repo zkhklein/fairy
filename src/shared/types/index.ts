@@ -107,9 +107,9 @@ export const WorkflowSchema = z.object({
   description: z.string().default(''),
   definition_json: zJsonText,
   vars_json: zJsonText,
-  // App plugin that owns and created this workflow.
-  // NOT NULL in DB; populated at creation from HostAPI callers.
-  owner_plugin_id: z.string().min(2),
+  // App plugin that owns and created this workflow. May be NULL for
+  // host-originated workflows (no built-in placeholder plugin required).
+  owner_plugin_id: z.string().min(2).nullable(),
   created_at: zUnixMs,
   updated_at: zUnixMs,
 });

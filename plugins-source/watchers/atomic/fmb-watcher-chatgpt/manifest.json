@@ -1,0 +1,22 @@
+{
+  "id": "com.fmb.watcher.chatgpt",
+  "name": "ChatGPT Watcher (Atomic)",
+  "version": "0.1.0",
+  "type": "atomic",
+  "description": "Atomic plugin: Check if ChatGPT desktop is running; restart only if exited (NEVER disturb a running instance). Executable path can be overridden per plugin-scoped KV `execPath`. Registers extension points so the watchdog app plugin can invoke it cross-plugin.",
+  "permissions": [
+    "log:write",
+    "kv:read",
+    "kv:write",
+    "system:process:read",
+    "system:process:start",
+    "extensions:register"
+  ],
+  "dependencies": {},
+  "main": "main.js",
+  "extensionPoints": [
+    "watchdog.check:chatgpt::onCheck",
+    "watchdog.ensureRunning:chatgpt::onEnsureRunning",
+    "watchdog.setExecPath:chatgpt::onSetExecPath"
+  ]
+}

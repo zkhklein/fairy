@@ -1,0 +1,22 @@
+{
+  "id": "com.fmb.watcher.traework",
+  "name": "TraeWork Watcher (Atomic)",
+  "version": "0.1.0",
+  "type": "atomic",
+  "description": "Atomic plugin: Check if TraeWork desktop is running; restart only if exited (NEVER disturb a running instance). Executable path can be overridden per plugin-scoped KV `execPath`. Also registers extension points so the watchdog app plugin can invoke it cross-plugin.",
+  "permissions": [
+    "log:write",
+    "kv:read",
+    "kv:write",
+    "system:process:read",
+    "system:process:start",
+    "extensions:register"
+  ],
+  "dependencies": {},
+  "main": "main.js",
+  "extensionPoints": [
+    "watchdog.check:traework::onCheck",
+    "watchdog.ensureRunning:traework::onEnsureRunning",
+    "watchdog.setExecPath:traework::onSetExecPath"
+  ]
+}

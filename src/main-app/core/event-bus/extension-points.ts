@@ -79,6 +79,8 @@ export type ExtensionEventMap = {
     pluginId: string;
     from: string;
     to: string;
+    /** Optional machine-readable cause, e.g. 'missing-on-disk' during rescan. */
+    reason?: string;
   };
   'workflow.beforeExecute': {
     runId: string;

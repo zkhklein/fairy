@@ -41,27 +41,86 @@ function _defaultLegacyRoot(): string {
   return path.join(os.homedir(), '.config', APP_DIR_NAME);
 }
 
+function _isWritable(dir: string): boolean {
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    const probe = path.join(dir, `.cli-write-probe-${process.pid}-${Date.now()}.tmp`);
+    fs.writeFileSync(probe, 'ok');
+    fs.unlinkSync(probe);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Portable root discovery. Mirror of runtime-paths.ts SSOT candidate order
+ * PLUS the SFX-FIRST strong-binding rule — the env candidate (SFX signal) is
+ * never preempted by later exe/cwd markers when the SFX env dir is real and
+ * writable. This keeps the CLI perfectly aligned with the Electron app.
+ *
+ * Priority:
+ *   ① PORTABLE_EXECUTABLE_DIR (electron-builder SFX portable builds)
+ *       → If dir is REAL: (a) read env marker, (b) else auto-portable if
+ *         {PED}/fmb-data writable (first SFX boot, no marker needed),
+ *         (c) else fallthrough.
+ *   ② process.execPath sibling (packaged CLI / non-SFX portable / NSIS)
+ *   ③ cwd/.data (dev fallback)
+ */
 function resolveRuntimePaths(): RuntimePaths {
-  const candidates: string[] = [];
-  // 1. Packaged CLI next to the app's exe → look for fmb-data/ marker alongside
-  try { candidates.push(path.join(path.dirname(process.execPath), FMB_PORTABLE_DIR, FMB_PORTABLE_MARKER)); } catch { /* noop */ }
-  // 2. Dev project root .data (cwd)
-  try { candidates.push(path.join(process.cwd(), '.data', FMB_PORTABLE_MARKER)); } catch { /* noop */ }
-  for (const markerPath of candidates) {
-    if (!fs.existsSync(markerPath)) continue;
+  const candidates: Array<{ kind: 'env'|'exe'|'cwd'; marker: string; envDir?: string }> = [];
+
+  // ① PORTABLE_EXECUTABLE_DIR (SFX) — only include if dir is real
+  const ped = (process.env.PORTABLE_EXECUTABLE_DIR || '').trim();
+  if (ped && fs.existsSync(ped) && fs.statSync(ped).isDirectory()) {
+    candidates.push({
+      kind: 'env',
+      marker: path.join(ped, FMB_PORTABLE_DIR, FMB_PORTABLE_MARKER),
+      envDir: ped,
+    });
+  }
+
+  // ② Packaged CLI next to the app's exe → look for fmb-data/ marker alongside
+  try { candidates.push({ kind: 'exe', marker: path.join(path.dirname(process.execPath), FMB_PORTABLE_DIR, FMB_PORTABLE_MARKER) }); } catch { /* noop */ }
+
+  // ③ Dev project root .data (cwd)
+  try { candidates.push({ kind: 'cwd', marker: path.join(process.cwd(), '.data', FMB_PORTABLE_MARKER) }); } catch { /* noop */ }
+
+  function wrap(root: string): RuntimePaths {
+    return {
+      mode: 'portable',
+      userData: path.join(root, 'userData'),
+      logs: path.join(root, 'logs'),
+      plugins: path.join(root, 'plugins'),
+    };
+  }
+
+  // ── Phase 1: SFX strong signal ────────────────────────────────────────
+  const envCand = candidates.find((c) => c.kind === 'env');
+  if (envCand && envCand.envDir) {
+    const fmb = path.join(envCand.envDir, FMB_PORTABLE_DIR);
+    // (1a) env marker exists and valid → locked
+    if (fs.existsSync(envCand.marker)) {
+      try {
+        const marker = JSON.parse(fs.readFileSync(envCand.marker, 'utf8')) as { portableRoot?: string };
+        if (marker.portableRoot) return wrap(marker.portableRoot);
+      } catch { /* corrupted → try (1b) */ }
+    }
+    // (1b) first SFX boot — auto-portable if writable
+    if (_isWritable(fmb)) return wrap(path.resolve(fmb));
+    // (1c) real env dir but NOT writable (read-only media) → fallthrough
+  }
+
+  // ── Phase 2: remaining candidates by existing marker ──────────────────
+  for (const c of candidates) {
+    if (c.kind === 'env') continue;
+    if (!fs.existsSync(c.marker)) continue;
     try {
-      const marker = JSON.parse(fs.readFileSync(markerPath, 'utf8')) as { portableRoot?: string };
-      if (marker.portableRoot) {
-        const root = marker.portableRoot;
-        return {
-          mode: 'portable',
-          userData: path.join(root, 'userData'),
-          logs: path.join(root, 'logs'),
-          plugins: path.join(root, 'plugins'),
-        };
-      }
+      const marker = JSON.parse(fs.readFileSync(c.marker, 'utf8')) as { portableRoot?: string };
+      if (marker.portableRoot) return wrap(marker.portableRoot);
     } catch { /* corrupted; skip */ }
   }
+
   const legacy = _defaultLegacyRoot();
   return { mode: 'legacy', userData: legacy, logs: path.join(legacy, 'logs'), plugins: path.join(legacy, 'plugins') };
 }
