@@ -1,6 +1,6 @@
 {
   "name": "fairy-maid-brigade",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "Fairy Maid Brigade - A cross-PC plugin-based inter-software workflow orchestration platform.",
   "main": "out/main/index.js",
