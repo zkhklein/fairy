@@ -18,6 +18,10 @@ import type {
   MainPluginValidateManifestParams, MainPluginValidateManifestResult,
   MainPluginListVersionsParams, MainPluginListVersionsResult,
   MainPluginSwitchVersionParams, MainPluginSwitchVersionResult,
+  MainPluginPreInstallCheckParams, MainPluginPreInstallCheckResult,
+  MainPluginInstallBatchParams, MainPluginInstallBatchResult,
+  MainPluginListScheduleTemplatesParams, MainPluginListScheduleTemplatesResult,
+  MainDialogShowOpenParams, MainDialogShowOpenResult,
   MainWorkflowListParams, MainWorkflowListResult,
   MainWorkflowGetParams, MainWorkflowGetResult,
   MainWorkflowCreateParams, MainWorkflowCreateResult,
@@ -65,8 +69,14 @@ const api = {
   pluginValidateManifest: (p: MainPluginValidateManifestParams) => invoke<MainPluginValidateManifestParams, MainPluginValidateManifestResult>(IPC_CHANNELS.main_plugin_validateManifest, p),
   pluginListVersions: (p: MainPluginListVersionsParams) => invoke<MainPluginListVersionsParams, MainPluginListVersionsResult>(IPC_CHANNELS.main_plugin_listVersions, p),
   pluginSwitchVersion: (p: MainPluginSwitchVersionParams) => invoke<MainPluginSwitchVersionParams, MainPluginSwitchVersionResult>(IPC_CHANNELS.main_plugin_switchVersion, p),
+  pluginPreInstallCheck: (p: MainPluginPreInstallCheckParams) => invoke<MainPluginPreInstallCheckParams, MainPluginPreInstallCheckResult>(IPC_CHANNELS.main_plugin_preInstallCheck, p),
+  pluginInstallBatch: (p: MainPluginInstallBatchParams) => invoke<MainPluginInstallBatchParams, MainPluginInstallBatchResult>(IPC_CHANNELS.main_plugin_installBatch, p),
+  pluginListScheduleTemplates: (p: MainPluginListScheduleTemplatesParams) => invoke<MainPluginListScheduleTemplatesParams, MainPluginListScheduleTemplatesResult>(IPC_CHANNELS.main_plugin_listScheduleTemplates, p),
   pluginGetRenderer: (p: MainPluginGetRendererParams) => invoke<MainPluginGetRendererParams, MainPluginGetRendererResult>(IPC_CHANNELS.main_plugin_getRenderer, p),
   pluginCallAction: (p: MainPluginCallActionParams) => invoke<MainPluginCallActionParams, MainPluginCallActionResult>(IPC_CHANNELS.main_plugin_callAction, p),
+
+  // Native dialogs (renderer cannot call dialog directly)
+  dialogShowOpen: (p: MainDialogShowOpenParams) => invoke<MainDialogShowOpenParams, MainDialogShowOpenResult>(IPC_CHANNELS.main_dialog_showOpen, p),
 
   // Workflows
   workflowList: (p: MainWorkflowListParams) => invoke<MainWorkflowListParams, MainWorkflowListResult>(IPC_CHANNELS.main_workflow_list, p),
@@ -113,3 +123,18 @@ declare global {
 }
 
 contextBridge.exposeInMainWorld('fmb', api);
+
+/**
+ * Bridge: broadcast main-process → renderer setting changes as a
+ * plain DOM `CustomEvent` so renderer React code doesn't need Node APIs.
+ *
+ * Usage inside the renderer:
+ *   window.addEventListener('fmb:settingsChanged', handler);
+ *
+ * The `detail` carries the list of keys the patch touched so a page can
+ * do targeted refresh instead of a full settings reload.
+ */
+ipcRenderer.on('fmb:settingsChanged', (_evt, payload) => {
+  const ev = new CustomEvent('fmb:settingsChanged', { detail: payload });
+  window.dispatchEvent(ev);
+});

@@ -65,28 +65,31 @@ export class PluginService {
   private readonly loadedInstances = new Map<string, PluginInstance>();
   // Wire WorkflowService callbacks once they become available post-boot, so
   // app plugins can use host.workflows.create() without cyclic imports.
+  // NOTE: these are *synchronous* callbacks; the Promise-returning wrapping
+  // (process.nextTick deferral) is done in buildHostSvcForPlugin() so the
+  // sandbox async continuation never touches better-sqlite3 directly.
   private workflowCallbacks: {
-    create?: HostApiServices['onCreateWorkflow'];
-    start?: HostApiServices['onStartWorkflow'];
-    get?: HostApiServices['onGetWorkflow'];
+    create?: (args: { id?: string; name: string; description?: string; definition: Record<string, unknown>; vars?: Record<string, unknown>; owner_plugin_id?: string | null; }) => Record<string, unknown>;
+    start?: (workflowId: string, input?: Record<string, unknown>) => Promise<{ runId: string; status: string }>;
+    get?: (id: string) => Record<string, unknown> | null;
   } = {};
   // Similarly for SchedulerService callbacks: create/toggle schedules.
   private scheduleCallbacks: {
-    create?: HostApiServices['onCreateSchedule'];
-    toggle?: HostApiServices['onToggleSchedule'];
+    create?: (args: { id?: string; name: string; cronExpr?: string; oneShotAtMs?: number; workflowId: string; input?: Record<string, unknown>; enabled?: boolean; owner_plugin_id: string; }) => Record<string, unknown>;
+    toggle?: (id: string, enabled: boolean) => Record<string, unknown> | null;
   } = {};
 
   setWorkflowCallbacks(cb: {
-    create?: HostApiServices['onCreateWorkflow'];
-    start?: HostApiServices['onStartWorkflow'];
-    get?: HostApiServices['onGetWorkflow'];
+    create?: (args: { id?: string; name: string; description?: string; definition: Record<string, unknown>; vars?: Record<string, unknown>; owner_plugin_id?: string | null; }) => Record<string, unknown>;
+    start?: (workflowId: string, input?: Record<string, unknown>) => Promise<{ runId: string; status: string }>;
+    get?: (id: string) => Record<string, unknown> | null;
   }): void {
     this.workflowCallbacks = { ...this.workflowCallbacks, ...cb };
   }
 
   setScheduleCallbacks(cb: {
-    create?: HostApiServices['onCreateSchedule'];
-    toggle?: HostApiServices['onToggleSchedule'];
+    create?: (args: { id?: string; name: string; cronExpr?: string; oneShotAtMs?: number; workflowId: string; input?: Record<string, unknown>; enabled?: boolean; owner_plugin_id: string; }) => Record<string, unknown>;
+    toggle?: (id: string, enabled: boolean) => Record<string, unknown> | null;
   }): void {
     this.scheduleCallbacks = { ...this.scheduleCallbacks, ...cb };
   }
@@ -379,37 +382,181 @@ export class PluginService {
   }
 
   // ---------------- Install ----------------
+
+  /**
+   * Dry-run pre-install check: validates zip integrity + manifest schema +
+   * version comparison vs. currently installed version + dependency check.
+   * Never writes DB nor filesystem beyond a tmp directory (cleaned up on exit).
+   * Used by the UI install confirmation modal to show per-zip statuses before
+   * committing to the actual install.
+   */
+  async preInstallCheckFromZip(
+    zipPath: string,
+  ): Promise<{
+    ok: boolean;
+    manifest?: PluginManifest;
+    versionStatus?: 'new' | 'upgrade' | 'downgrade' | 'same';
+    installedVersion?: string;
+    depCheck: DepCheckResult;
+    errors: Array<{ code?: string; message: string; detail?: unknown }>;
+  }> {
+    const tmpDir = path.join(this.pluginsRoot, `.pre-${nanoid(8)}`);
+    try {
+      const errors: Array<{ code?: string; message: string; detail?: unknown }> = [];
+      let manifest: PluginManifest | undefined;
+      // 1. zip integrity + extract manifest dir + parse
+      try {
+        const zip = new AdmZip(zipPath);
+        fs.mkdirSync(tmpDir, { recursive: true });
+        zip.extractAllTo(tmpDir, true);
+      } catch (e: any) {
+        errors.push({ code: 'zip.extract_failed', message: e?.message ?? 'Zip extract failed', detail: zipPath });
+        return { ok: false, depCheck: { ok: false, missing: [], conflicts: [], cycles: [] }, errors };
+      }
+      const parsed = readManifestFromDir(tmpDir, { instance: zipPath });
+      if (!parsed.ok) {
+        errors.push({ code: 'manifest.invalid', message: parsed.error?.detail ?? parsed.error?.title ?? 'Invalid manifest', detail: parsed.error });
+        return { ok: false, depCheck: { ok: false, missing: [], conflicts: [], cycles: [] }, errors };
+      }
+      manifest = parsed.manifest;
+
+      // 2. version status vs DB
+      const existing = this.get(manifest.id);
+      const installedVersion = existing?.current_version;
+      let versionStatus: 'new' | 'upgrade' | 'downgrade' | 'same' = 'new';
+      if (installedVersion) {
+        if (semver.valid(installedVersion) && semver.valid(manifest.version)) {
+          if (semver.eq(manifest.version, installedVersion)) versionStatus = 'same';
+          else if (semver.gt(manifest.version, installedVersion)) versionStatus = 'upgrade';
+          else versionStatus = 'downgrade';
+        } else if (manifest.version === installedVersion) {
+          versionStatus = 'same';
+        } else {
+          // non-semver: treat as same when equal else new-install-ish (upgrade)
+          versionStatus = manifest.version === installedVersion ? 'same' : 'upgrade';
+        }
+      }
+
+      // 3. dependency check
+      const depCheck = this.parseDependencies(manifest.dependencies ?? {}, { forManifest: manifest });
+      for (const m of depCheck.missing) errors.push({ code: 'dep.missing', message: m.reason, detail: { depId: m.depId, requested: m.requested } });
+      for (const c of depCheck.conflicts) errors.push({ code: 'dep.conflict', message: c.reason, detail: { depId: c.depId, requested: c.requested, installed: c.installed } });
+      for (const cycle of depCheck.cycles) errors.push({ code: 'dep.cycle', message: `Dependency cycle: ${cycle.join(' → ')}`, detail: cycle });
+
+      return {
+        ok: depCheck.ok && errors.length === 0,
+        manifest,
+        versionStatus,
+        installedVersion,
+        depCheck,
+        errors,
+      };
+    } finally {
+      if (fs.existsSync(tmpDir)) try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* noop */ }
+    }
+  }
+
+  /**
+   * Install multiple zips sequentially. Optionally auto-enable each on success.
+   * The caller can control auto-enable to avoid surprises (e.g. dependency
+   * chains requiring deterministic enable order are handled by pre-install
+   * checks rather than this method).
+   */
+  async installBatch(args: { zipPaths: string[]; autoEnable?: boolean }): Promise<{
+    results: Array<{
+      zipPath: string; ok: boolean; pluginId?: string; version?: string; autoEnabled?: boolean;
+      errors: Array<{ code?: string; message: string; detail?: unknown }>;
+    }>;
+  }> {
+    type BatchResultItem = {
+      zipPath: string; ok: boolean; pluginId?: string; version?: string; autoEnabled?: boolean;
+      errors: Array<{ code?: string; message: string; detail?: unknown }>;
+    };
+    const results: BatchResultItem[] = [];
+    for (const zipPath of args.zipPaths) {
+      const installed = await this.installFromZip(zipPath);
+      if (!installed.ok) {
+        results.push({
+          zipPath,
+          ok: false,
+          errors: [{
+            code: (installed.error as any)?.code,
+            message: installed.error?.detail ?? installed.error?.title ?? 'Install failed',
+            detail: installed.error,
+          }],
+        });
+        continue;
+      }
+      let autoEnabled = false;
+      const errors: BatchResultItem['errors'] = [];
+      if (args.autoEnable && installed.pluginId) {
+        try {
+          const en = await this.enablePlugin(installed.pluginId!);
+          if (!en.ok) {
+            errors.push({
+              code: 'enable_failed',
+              message: en.error?.detail ?? en.error?.title ?? 'Enable failed',
+              detail: en.error,
+            });
+          } else {
+            autoEnabled = true;
+          }
+        } catch (e: any) {
+          errors.push({ code: 'enable_failed', message: e?.message ?? 'Enable failed', detail: String(e) });
+        }
+      }
+      results.push({
+        zipPath,
+        ok: true,
+        pluginId: installed.pluginId,
+        version: installed.version,
+        autoEnabled,
+        errors,
+      });
+    }
+    return { results };
+  }
+
   async installFromZip(zipPath: string): Promise<InstallResult> {
     const tmpDir = path.join(this.pluginsRoot, `.tmp-${nanoid(8)}`);
     const cleanupPaths: string[] = [tmpDir];
     try {
-      const zip = new AdmZip(zipPath);
-      fs.mkdirSync(tmpDir, { recursive: true });
-      zip.extractAllTo(tmpDir, /*overwrite*/ true);
-
-      const parsed = readManifestFromDir(tmpDir, { instance: zipPath });
-      if (!parsed.ok) return { ok: false, error: { ...parsed.error, cleanup: cleanupPaths } };
-      const manifest = parsed.manifest;
-
-      const dep = this.parseDependencies(manifest.dependencies ?? {}, { forManifest: manifest });
-      if (!dep.ok) {
-        const errors: PathMsg[] = [];
-        errors.push(...dep.missing.map(m => ({ path: ['dependencies', m.depId], message: m.reason, code: 'dep.missing' })));
-        errors.push(...dep.conflicts.map(c => ({ path: ['dependencies', c.depId], message: c.reason, code: 'dep.conflict' })));
-        errors.push(...dep.cycles.map(c => ({ path: ['dependencies'], message: `cycle: ${c.join(' → ')}`, code: 'dep.cycle' })));
+      // Use the dry-run pre-check for manifest + dep validation to keep this
+      // method's behavior consistent with the UI preview surface.
+      const pre = await this.preInstallCheckFromZip(zipPath);
+      if (!pre.manifest) {
         return {
           ok: false,
           error: {
-            type: 'https://fmb.dev/problems/dependency-check-failed',
-            title: 'Dependency Check Failed',
+            type: 'https://fmb.dev/problems/manifest-invalid',
+            title: 'Manifest invalid',
             status: 400,
-            detail: errors.map(e => `${e.path.join('/')}: ${e.message}`).join('; '),
-            errors,
+            detail: pre.errors.map((e) => e.message).join('; '),
+            errors: pre.errors as any,
             instance: zipPath,
             cleanup: cleanupPaths,
           },
         };
       }
+      if (!pre.ok) {
+        return {
+          ok: false,
+          error: {
+            type: 'https://fmb.dev/problems/dependency-check-failed',
+            title: 'Dependency / Validation Failed',
+            status: 400,
+            detail: pre.errors.map((e) => e.message).join('; '),
+            errors: pre.errors as any,
+            instance: zipPath,
+            cleanup: cleanupPaths,
+          },
+        };
+      }
+      const manifest = pre.manifest;
+      // Re-extract into tmpDir (preInstallCheck wiped its tmp dir)
+      const zip = new AdmZip(zipPath);
+      fs.mkdirSync(tmpDir, { recursive: true });
+      zip.extractAllTo(tmpDir, true);
 
       try {
         await this.bus.safeEmit('plugin.beforeInstall', { manifest, sourceZip: zipPath }, { source: 'plugin.service', strict: true });
@@ -556,11 +703,42 @@ export class PluginService {
       eventBus: this.bus,
       pluginService: this,
       selfManifest: manifest,
-      onCreateWorkflow: (a) => this.workflowCallbacks.create?.(a) ?? {},
-      onStartWorkflow: (id, input) => Promise.resolve(this.workflowCallbacks.start?.(id, input) ?? { runId: '', status: 'pending' }),
-      onGetWorkflow: (id) => this.workflowCallbacks.get?.(id) ?? null,
-      onCreateSchedule: (a) => this.scheduleCallbacks.create?.(a) ?? {},
-      onToggleSchedule: (id, enabled) => this.scheduleCallbacks.toggle?.(id, enabled) ?? null,
+      // Defer synchronous better-sqlite3 / scheduler operations to the main
+      // process event loop via process.nextTick. Calling these directly inside
+      // a vm.Script sandbox async continuation crashes the native module
+      // (V8 context mismatch, 0xC0000005 access violation).
+      onCreateWorkflow: (a) => new Promise((resolve, reject) => {
+        process.nextTick(() => {
+          try {
+            resolve(this.workflowCallbacks.create?.(a) ?? {});
+          } catch (e: any) {
+            log.error({ err: String(e?.stack ?? e), pluginId: id }, 'onCreateWorkflow deferred callback failed');
+            reject(e instanceof Error ? e : new Error(String(e)));
+          }
+        });
+      }),
+      onStartWorkflow: (wfId, input) => Promise.resolve(this.workflowCallbacks.start?.(wfId, input) ?? { runId: '', status: 'pending' }),
+      onGetWorkflow: (wfId) => this.workflowCallbacks.get?.(wfId) ?? null,
+      onCreateSchedule: (a) => new Promise((resolve, reject) => {
+        process.nextTick(() => {
+          try {
+            resolve(this.scheduleCallbacks.create?.(a) ?? {});
+          } catch (e: any) {
+            log.error({ err: String(e?.stack ?? e), pluginId: id }, 'onCreateSchedule deferred callback failed');
+            reject(e instanceof Error ? e : new Error(String(e)));
+          }
+        });
+      }),
+      onToggleSchedule: (schedId, enabled) => new Promise((resolve, reject) => {
+        process.nextTick(() => {
+          try {
+            resolve(this.scheduleCallbacks.toggle?.(schedId, enabled) ?? null);
+          } catch (e: any) {
+            log.error({ err: String(e?.stack ?? e), pluginId: id }, 'onToggleSchedule deferred callback failed');
+            reject(e instanceof Error ? e : new Error(String(e)));
+          }
+        });
+      }),
       onAudit: (a) => {
         try {
           // audit_logs.source CHECK IN ('ui','cli','http','system','plugin'); use just 'plugin'

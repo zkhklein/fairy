@@ -3,18 +3,83 @@
   "name": "Demo Counter (App)",
   "version": "0.1.0",
   "type": "app",
-  "description": "App plugin with a +1/-1 Counter sub-page. Renderer calls main via HostUIApi; main bumps a kv counter and pings atomic-demo's demo.echo extension point (bidirectional comms).",
+  "description": "App plugin with a +1/-1 Counter sub-page. Renderer calls main via HostUIApi; main bumps a kv counter and pings atomic-demo's demo.echo extension point (bidirectional comms). Also ships two schedule templates to demonstrate the new UI '添加定时任务' template dropdown.",
   "permissions": [
     "log:write",
     "audit:write",
     "kv:read",
     "kv:write",
     "workflows:execute",
-    "extensions:call"
+    "extensions:call",
+    "schedules:read",
+    "schedules:write"
   ],
   "dependencies": {
     "com.fmb.demo.atomic": "^0.1.0"
   },
   "main": "main.js",
-  "renderer": "renderer/index.ts"
+  "renderer": "renderer/index.ts",
+  "extensionPoints": [
+    "schedule.template.com.fmb.demo.app.bump_every_hour::onBumpEveryHour",
+    "schedule.template.com.fmb.demo.app.nightly_reset::onNightlyReset"
+  ],
+  "scheduleTemplates": [
+    {
+      "id": "bump_every_hour",
+      "label": "每小时 Counter +1",
+      "description": "到点触发，通过 kv 把 counter 加 N（默认 +1）。如果 notify=true，同时写一条 audit_log。",
+      "defaultCron": "0 * * * *",
+      "misfirePolicy": "run_now",
+      "paramsSchema": {
+        "step": {
+          "label": "增量",
+          "description": "每次触发给 counter 加多少（正数加、负数减）",
+          "type": "number",
+          "required": true,
+          "defaultValue": 1
+        },
+        "notify": {
+          "label": "触发后通知",
+          "description": "写入 audit_log 作为通知记录",
+          "type": "boolean",
+          "required": false,
+          "defaultValue": true
+        },
+        "tag": {
+          "label": "本次触发标签",
+          "description": "会写入 audit_log.source，便于过滤",
+          "type": "select",
+          "required": false,
+          "defaultValue": "hourly",
+          "options": [
+            { "label": "每小时（hourly）", "value": "hourly" },
+            { "label": "每夜（nightly）", "value": "nightly" },
+            { "label": "手工（manual）", "value": "manual" }
+          ]
+        },
+        "note": {
+          "label": "备注",
+          "description": "任意字符串，原样透传到 audit_log.params.note",
+          "type": "string",
+          "required": false
+        }
+      }
+    },
+    {
+      "id": "nightly_reset",
+      "label": "每日凌晨 Counter 清零",
+      "description": "每天 03:00 把 kv 计数器清零；保留最近一次清零时间戳。",
+      "defaultCron": "0 3 * * *",
+      "misfirePolicy": "skip",
+      "paramsSchema": {
+        "keepBackup": {
+          "label": "保留备份值",
+          "description": "若勾选，清零前先写入 counter.last_known_value",
+          "type": "boolean",
+          "required": false,
+          "defaultValue": true
+        }
+      }
+    }
+  ]
 }

@@ -65,4 +65,95 @@ module.exports = {
     const v = parseInt((await hostApi.kv.get('count')) ?? '0', 10);
     return { count: Number.isFinite(v) ? v : 0 };
   },
+
+  /**
+   * Schedule template handler: `bump_every_hour` (manifest.scheduleTemplates[0]).
+   * Registered via manifest.extensionPoints as
+   *   `schedule.template.com.fmb.demo.app.bump_every_hour::onBumpEveryHour`.
+   *
+   * Payload = schedule_runtime_envelope { scheduleId, params, pluginId, ... }.
+   *   - params.step   (number,  default 1) : counter delta
+   *   - params.notify (boolean, default true) : extra audit record
+   *   - params.tag    (string|hourly|nightly|manual) : audit source tag
+   *   - params.note   (string optional)    : arbitrary note attached to audit
+   */
+  async onBumpEveryHour(payload) {
+    const params = (payload && payload.params) ? payload.params : {};
+    const step = typeof params.step === 'number' ? params.step
+      : params.step !== undefined ? Number(params.step) : 1;
+    const notify = typeof params.notify === 'boolean' ? params.notify : true;
+    const tag = typeof params.tag === 'string' ? params.tag : 'hourly';
+    const note = typeof params.note === 'string' ? params.note : '';
+    const effectiveStep = Number.isFinite(step) ? step : 1;
+
+    const prev = parseInt((await hostApi.kv.get('count')) ?? '0', 10);
+    const next = (Number.isFinite(prev) ? prev : 0) + effectiveStep;
+    await hostApi.kv.set('count', String(next));
+
+    hostApi.audit.record(`schedule.${tag}.bump`, {
+      count: next,
+      step: effectiveStep,
+      scheduleId: payload && payload.scheduleId ? payload.scheduleId : null,
+      note,
+    });
+
+    if (notify) {
+      hostApi.audit.record('schedule.bump.notify', {
+        count: next,
+        at: new Date().toISOString(),
+      });
+    }
+
+    try {
+      await hostApi.extensions.call('demo.echo', {
+        value: next,
+        source: 'app-demo.schedule.bump',
+        tag,
+      });
+    } catch (e) {
+      hostApi.logger.warn('app-demo schedule: demo.echo ping failed', {
+        error: e && e.message ? e.message : String(e),
+      });
+    }
+
+    hostApi.logger.info('schedule bump_every_hour executed', {
+      prev, next: next, step: effectiveStep, tag, scheduleId: payload && payload.scheduleId,
+    });
+    return { ok: true, count: next, step: effectiveStep, tag, note };
+  },
+
+  /**
+   * Schedule template handler: `nightly_reset`.
+   * Registered via manifest.extensionPoints as
+   *   `schedule.template.com.fmb.demo.app.nightly_reset::onNightlyReset`.
+   *
+   * Payload.params:
+   *   - keepBackup (boolean, default true) : backup the last value before reset.
+   */
+  async onNightlyReset(payload) {
+    const params = (payload && payload.params) ? payload.params : {};
+    const keepBackup = typeof params.keepBackup === 'boolean' ? params.keepBackup : true;
+
+    const raw = await hostApi.kv.get('count');
+    const prev = parseInt(raw ?? '0', 10);
+    const prevValue = Number.isFinite(prev) ? prev : 0;
+
+    if (keepBackup) {
+      await hostApi.kv.set('counter.last_known_value', String(prevValue));
+      await hostApi.kv.set('counter.last_reset_at', new Date().toISOString());
+    }
+    await hostApi.kv.set('count', '0');
+
+    hostApi.audit.record('schedule.nightly_reset', {
+      prev: prevValue,
+      keepBackup,
+      scheduleId: payload && payload.scheduleId ? payload.scheduleId : null,
+    });
+
+    hostApi.logger.info('schedule nightly_reset executed', {
+      prev: prevValue, keepBackup,
+      scheduleId: payload && payload.scheduleId,
+    });
+    return { ok: true, resetFrom: prevValue, keepBackup };
+  },
 };

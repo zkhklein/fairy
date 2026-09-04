@@ -30,6 +30,7 @@ import {
   PluginViewModelSchema,
   RunViewModelSchema,
   ScheduleSchema,
+  ScheduleTemplateSchema,
   WorkflowRunStatus,
   WorkflowSchema,
   WorkflowViewModelSchema,
@@ -88,6 +89,82 @@ export const main_plugin_validateManifest = make({
   params: z.record(z.string(), z.unknown()),
   result: z.object({ ok: z.boolean(), manifest: PluginManifestSchema.optional(), errors: z.array(z.any()).default([]) }),
   description: 'Dry-run manifest validation used by the upload UI.',
+});
+
+// ---------- Native file dialog (renderer cannot open OS dialogs directly) ----------
+const DialogFileFilterSchema = z.object({ name: z.string().min(1), extensions: z.array(z.string().max(32)) });
+export const main_dialog_showOpen = make({
+  channel: 'main:dialog.showOpen',
+  params: z.object({
+    title: z.string().max(200).optional(),
+    defaultPath: z.string().max(1024).optional(),
+    buttonLabel: z.string().max(64).optional(),
+    multiSelections: z.boolean().default(false),
+    openDirectory: z.boolean().default(false),
+    openFile: z.boolean().default(true),
+    filters: z.array(DialogFileFilterSchema).default([]),
+  }),
+  result: z.object({ canceled: z.boolean(), filePaths: z.array(z.string()).default([]) }),
+});
+
+// ---------- Pre-install check (dry-run: validate zip + manifest + version + deps) ----------
+const VersionStatusSchema = z.enum(['new', 'upgrade', 'downgrade', 'same']);
+const DepCheckIssueSchema = z.object({
+  depId: z.string().min(1),
+  requested: z.string().min(1),
+  reason: z.string().min(1),
+  installed: z.string().optional(),
+});
+const DepCheckResultSchema = z.object({
+  ok: z.boolean(),
+  missing: z.array(DepCheckIssueSchema).default([]),
+  conflicts: z.array(DepCheckIssueSchema).default([]),
+  cycles: z.array(z.array(z.string())).default([]),
+});
+export const main_plugin_preInstallCheck = make({
+  channel: 'main:plugin.preInstallCheck',
+  params: z.object({ zipPath: z.string().min(1) }),
+  result: z.object({
+    ok: z.boolean(),
+    zipPath: z.string().min(1),
+    manifest: PluginManifestSchema.optional(),
+    versionStatus: VersionStatusSchema.optional(),
+    installedVersion: z.string().optional(),
+    depCheck: DepCheckResultSchema,
+    errors: z.array(z.object({ code: z.string().optional(), message: z.string(), detail: z.unknown().optional() })).default([]),
+  }),
+});
+
+// ---------- Batch install ----------
+export const main_plugin_installBatch = make({
+  channel: 'main:plugin.installBatch',
+  params: z.object({
+    zipPaths: z.array(z.string().min(1)).min(1),
+    autoEnable: z.boolean().default(false),
+  }),
+  result: z.object({
+    results: z.array(z.object({
+      zipPath: z.string().min(1),
+      ok: z.boolean(),
+      pluginId: z.string().min(2).optional(),
+      version: z.string().optional(),
+      autoEnabled: z.boolean().default(false),
+      errors: z.array(z.object({ code: z.string().optional(), message: z.string(), detail: z.unknown().optional() })).default([]),
+    })),
+  }),
+});
+
+// ---------- App plugins schedule templates listing ----------
+export const main_plugin_listScheduleTemplates = make({
+  channel: 'main:plugin.listScheduleTemplates',
+  params: z.object({}).strict().default({}),
+  result: z.object({
+    items: z.array(z.object({
+      pluginId: z.string().min(2),
+      pluginName: z.string().min(1),
+      templates: z.array(ScheduleTemplateSchema),
+    })),
+  }),
 });
 
 // ---------- Workflows ----------
@@ -181,6 +258,16 @@ export const main_schedule_create = make({
     enabled: z.union([z.literal(0), z.literal(1)]).default(1),
     timezone: ScheduleSchema.shape.timezone,
     name: z.string().min(1),
+    // When present, the handler MUST (a) validate the plugin is type=app + enabled,
+    // then (b) dispatch the creation through the same plugin-owned Host.schedules.create
+    // callback so ownership is enforced (v3 permission contract).
+    owner_plugin_id: z.string().min(2).optional(),
+    // Template info + typed user params, set by the UI add-schedule modal
+    // when the user picks a `scheduleTemplates[]` entry declared by an app
+    // plugin. Not persisted on the schedule table — they're folded into
+    // `input_json` so the scheduler still runs standalone.
+    template_id: z.string().min(1).optional(),
+    params: z.record(z.string(), z.unknown()).optional(),
   }),
   result: ScheduleSchema,
 });
@@ -276,15 +363,17 @@ export const main_system_health = make({
 
 // ---------- Settings (T11 Settings page) ----------
 const LogLevelSchema = z.enum(['fatal','error','warn','info','debug','trace','silent']);
+// Shared transformer: accept 0/1 numeric or boolean from UI Switch → always 0|1.
+const boolOrBit = z.union([z.literal(0), z.literal(1), z.boolean()]).transform((v) => (typeof v === 'boolean' ? (v ? 1 : 0) : v) as 0 | 1);
 const SettingsSchema = z.object({
   'queue.concurrency': z.number().int().min(1).max(256),
   'http.port': z.number().int().min(1024).max(65535),
   'http.token': z.string(),
   'log.level': LogLevelSchema,
-  'system.autoStart': z.union([z.literal(0), z.literal(1)]),
+  'system.autoStart': boolOrBit,
   'system.closeBehavior': z.enum(['tray', 'quit']),
-  'ui.compact': z.union([z.literal(0), z.literal(1)]),
-  'ui.collapsed': z.union([z.literal(0), z.literal(1)]),
+  'ui.compact': boolOrBit,
+  'ui.collapsed': boolOrBit,
 });
 export const main_system_getSettings = make({
   channel: 'main:system.getSettings',
@@ -293,7 +382,17 @@ export const main_system_getSettings = make({
 });
 export const main_system_setSettings = make({
   channel: 'main:system.setSettings',
-  params: SettingsSchema.partial(),
+  // Partial patch uses the union variant of Settings — each key can be omitted.
+  params: z.object({
+    'queue.concurrency': z.number().int().min(1).max(256).optional(),
+    'http.port': z.number().int().min(1024).max(65535).optional(),
+    'http.token': z.string().optional(),
+    'log.level': LogLevelSchema.optional(),
+    'system.autoStart': boolOrBit.optional(),
+    'system.closeBehavior': z.enum(['tray', 'quit']).optional(),
+    'ui.compact': boolOrBit.optional(),
+    'ui.collapsed': boolOrBit.optional(),
+  }),
   result: SettingsSchema,
 });
 
@@ -377,6 +476,8 @@ export const main_plugin_callAction = make({
 export const IPC_REGISTRY: readonly IpcChannel<unknown, unknown>[] = [
   main_plugin_list, main_plugin_get, main_plugin_install, main_plugin_setStatus,
   main_plugin_uninstall, main_plugin_validateManifest, main_plugin_listVersions, main_plugin_switchVersion,
+  main_plugin_preInstallCheck, main_plugin_installBatch, main_plugin_listScheduleTemplates,
+  main_dialog_showOpen,
   main_workflow_list, main_workflow_get, main_workflow_create, main_workflow_update,
   main_workflow_delete, main_workflow_runStart, main_workflow_runCancel, main_workflow_runList, main_workflow_exportJson,
   main_schedule_list, main_schedule_create, main_schedule_toggle, main_schedule_delete,
@@ -399,6 +500,12 @@ export const IPC_CHANNELS = {
   main_plugin_setStatus: main_plugin_setStatus.channel,
   main_plugin_uninstall: main_plugin_uninstall.channel,
   main_plugin_validateManifest: main_plugin_validateManifest.channel,
+  main_plugin_listVersions: main_plugin_listVersions.channel,
+  main_plugin_switchVersion: main_plugin_switchVersion.channel,
+  main_plugin_preInstallCheck: main_plugin_preInstallCheck.channel,
+  main_plugin_installBatch: main_plugin_installBatch.channel,
+  main_plugin_listScheduleTemplates: main_plugin_listScheduleTemplates.channel,
+  main_dialog_showOpen: main_dialog_showOpen.channel,
   main_workflow_list: main_workflow_list.channel,
   main_workflow_get: main_workflow_get.channel,
   main_workflow_create: main_workflow_create.channel,
@@ -423,8 +530,6 @@ export const IPC_CHANNELS = {
   main_system_setSettings: main_system_setSettings.channel,
   main_queue_setConcurrency: main_queue_setConcurrency.channel,
   main_ep_list: main_ep_list.channel,
-  main_plugin_listVersions: main_plugin_listVersions.channel,
-  main_plugin_switchVersion: main_plugin_switchVersion.channel,
   main_workflow_exportJson: main_workflow_exportJson.channel,
   main_plugin_getRenderer: main_plugin_getRenderer.channel,
   main_plugin_callAction: main_plugin_callAction.channel,
@@ -443,6 +548,14 @@ export type MainPluginUninstallParams = z.infer<typeof main_plugin_uninstall.par
 export type MainPluginUninstallResult = z.infer<typeof main_plugin_uninstall.result>;
 export type MainPluginValidateManifestParams = z.infer<typeof main_plugin_validateManifest.params>;
 export type MainPluginValidateManifestResult = z.infer<typeof main_plugin_validateManifest.result>;
+export type MainDialogShowOpenParams = z.infer<typeof main_dialog_showOpen.params>;
+export type MainDialogShowOpenResult = z.infer<typeof main_dialog_showOpen.result>;
+export type MainPluginPreInstallCheckParams = z.infer<typeof main_plugin_preInstallCheck.params>;
+export type MainPluginPreInstallCheckResult = z.infer<typeof main_plugin_preInstallCheck.result>;
+export type MainPluginInstallBatchParams = z.infer<typeof main_plugin_installBatch.params>;
+export type MainPluginInstallBatchResult = z.infer<typeof main_plugin_installBatch.result>;
+export type MainPluginListScheduleTemplatesParams = z.infer<typeof main_plugin_listScheduleTemplates.params>;
+export type MainPluginListScheduleTemplatesResult = z.infer<typeof main_plugin_listScheduleTemplates.result>;
 
 export type MainWorkflowListParams = z.infer<typeof main_workflow_list.params>;
 export type MainWorkflowListResult = z.infer<typeof main_workflow_list.result>;

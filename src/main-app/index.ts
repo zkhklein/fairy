@@ -23,7 +23,7 @@ const __RUNTIME_PATHS__ = (() => {
 })();
 
 import { initDatabase, closeDatabase } from './core/db';
-import { createLogger } from './core/logger';
+import { createLogger, setGlobalLogLevel } from './core/logger';
 import { audit, newTraceId } from './core/audit';
 import { initEventBus, getEventBus } from './core/event-bus';
 import { initPluginService, getPluginService } from './core/plugin';
@@ -290,6 +290,16 @@ app.whenReady().then(() => {
     const _settingsSvc = initSettingsService();
     // Apply saved concurrency immediately so user preference beats default
     try { queueSvc.setConcurrency(_settingsSvc.get('queue.concurrency')); } catch { /* noop */ }
+    // Apply saved global log level before the rest of boot so subsequent
+    // subservices (http, tray, notify, worker) pick up the user's choice,
+    // not the "info" default.
+    try { setGlobalLogLevel(_settingsSvc.get('log.level')); } catch { /* noop */ }
+    // Apply auto-start preference at boot so even if settings were edited
+    // outside the settings UI (CLI / HTTP), it still gets respected.
+    try {
+      const open = _settingsSvc.get('system.autoStart') === 1;
+      app.setLoginItemSettings({ openAtLogin: open, path: app.getPath('exe') });
+    } catch { /* noop */ }
     mk('SETTINGS_SERVICE_OK');
     const bootTs = bootStart;
     const disposeIpc = registerIpcHandlers({
@@ -302,6 +312,7 @@ app.whenReady().then(() => {
       bootTs,
       logsDir: getLogsDir(),
       pluginsDir: pluginSvc.root,
+      get mainWindow() { return mainWindow; },
     });
     mk('IPC_HANDLERS_REGISTERED');
     // Start worker subsystems (non-blocking)

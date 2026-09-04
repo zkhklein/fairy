@@ -79,10 +79,14 @@ export function getLogsDir(): string { return resolveLogsDir(); }
 export function createLogger(name = 'main', overrides: LoggerOptions = {}): Logger {
   const cached = loggerCache.get(name);
   if (cached) return cached;
+  const level =
+    process.env.FMB_LOG_LEVEL ??
+    currentGlobalLevel ??
+    (app.isPackaged ? 'info' : 'debug');
   const logger = pino(
     {
       name: `fmb.${name}`,
-      level: process.env.FMB_LOG_LEVEL ?? (app.isPackaged ? 'info' : 'debug'),
+      level,
       base: { pid: process.pid },
       timestamp: pino.stdTimeFunctions.isoTime,
       formatters: {
@@ -98,4 +102,30 @@ export function createLogger(name = 'main', overrides: LoggerOptions = {}): Logg
   );
   loggerCache.set(name, logger);
   return logger;
+}
+
+// Global log level override that is applied to:
+//   1) Any logger created AFTER this call (takes effect in createLogger above)
+//   2) All already-cached loggers (iterates cache and updates logger.level)
+// Levels allowed: the pino subset accepted by settings service.
+// NOTE: pino's exported `Level` omits 'silent' from its literal type even
+// though runtime accepts it; we cast below through a known-safe tuple.
+const VALID_LEVELS: readonly (pino.Level | 'silent')[] = [
+  'fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent',
+];
+let currentGlobalLevel: pino.Level | null = null;
+
+export function setGlobalLogLevel(next: string): void {
+  const level = VALID_LEVELS.includes(next as typeof VALID_LEVELS[number])
+    ? (next as pino.Level)
+    : null;
+  if (!level) return;
+  currentGlobalLevel = level;
+  for (const [, lg] of loggerCache) {
+    try { lg.level = level; } catch { /* ignore broken instances */ }
+  }
+}
+
+export function getGlobalLogLevel(): pino.Level | 'info' {
+  return currentGlobalLevel ?? 'info';
 }

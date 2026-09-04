@@ -24,6 +24,9 @@ import type {
   MainPluginListVersionsResult,
   MainWorkflowExportJsonResult,
   MainQueueSetConcurrencyResult,
+  MainPluginPreInstallCheckResult,
+  MainPluginInstallBatchResult,
+  MainPluginListScheduleTemplatesResult,
 } from '@shared/ipc';
 
 type FetchState = { loading: boolean; error: string | null; ts: number };
@@ -33,9 +36,20 @@ interface PluginState extends FetchState {
   data: MainPluginListResult | null;
   versions: { pluginId: string; items: MainPluginListVersionsResult['items'] } | null;
   versionsError: string | null;
+  // Install flow (UI-facing: preCheck result cache + batch result)
+  preChecks: Array<MainPluginPreInstallCheckResult>;
+  preChecksLoading: boolean;
+  batchResults: MainPluginInstallBatchResult['results'] | null;
+  batchLoading: boolean;
+  scheduleTemplates: MainPluginListScheduleTemplatesResult | null;
+  scheduleTemplatesLoading: boolean;
+
   list: (params?: Parameters<typeof fmbApi.pluginList>[0]) => Promise<void>;
   listVersions: (id: string) => Promise<void>;
   switchVersion: (id: string, version: string) => Promise<void>;
+  preInstallBatch: (zipPaths: string[]) => Promise<void>;
+  installBatch: (args: { zipPaths: string[]; autoEnable?: boolean }) => Promise<void>;
+  loadScheduleTemplates: () => Promise<void>;
 }
 export const usePluginStore = create<PluginState>((set, get) => ({
   loading: false,
@@ -44,6 +58,13 @@ export const usePluginStore = create<PluginState>((set, get) => ({
   data: null,
   versions: null,
   versionsError: null,
+  preChecks: [],
+  preChecksLoading: false,
+  batchResults: null,
+  batchLoading: false,
+  scheduleTemplates: null,
+  scheduleTemplatesLoading: false,
+
   list: async (p = {}) => {
     if (get().loading) return;
     set({ loading: true, error: null });
@@ -66,6 +87,47 @@ export const usePluginStore = create<PluginState>((set, get) => ({
   switchVersion: async (id, version) => {
     await fmbApi.pluginSwitchVersion({ id, version });
     void Promise.all([get().list(), get().listVersions(id)]);
+  },
+  preInstallBatch: async (zipPaths) => {
+    set({ preChecksLoading: true, error: null });
+    try {
+      const results = await Promise.all(
+        zipPaths.map((zp) => fmbApi.pluginPreInstallCheck({ zipPath: zp })),
+      );
+      set({ preChecksLoading: false, preChecks: results });
+    } catch (e) {
+      set({
+        preChecksLoading: false,
+        error: (e as { message?: string }).message ?? '预检查失败',
+      });
+    }
+  },
+  installBatch: async ({ zipPaths, autoEnable = false }) => {
+    set({ batchLoading: true, batchResults: null });
+    try {
+      const r = await fmbApi.pluginInstallBatch({ zipPaths, autoEnable });
+      set({ batchLoading: false, batchResults: r.results });
+      void get().list(); // refresh table
+    } catch (e) {
+      set({
+        batchLoading: false,
+        error: (e as { message?: string }).message ?? '批量安装失败',
+      });
+    }
+  },
+  loadScheduleTemplates: async () => {
+    set({ scheduleTemplatesLoading: true });
+    try {
+      set({
+        scheduleTemplates: await fmbApi.pluginListScheduleTemplates(),
+        scheduleTemplatesLoading: false,
+      });
+    } catch (e) {
+      set({
+        scheduleTemplatesLoading: false,
+        error: (e as { message?: string }).message ?? '模板加载失败',
+      });
+    }
   },
 }));
 
@@ -155,8 +217,19 @@ export const useErrorStore = create<ErrorLogState>((set, get) => ({
 
 // ---------------- System + UI store ----------------
 export interface UiState {
+  // Persisted (loaded from settings service; folded in once on loadSystem).
+  uiCompact: 0 | 1;
+  uiCollapsed: 0 | 1;
+  // Transient runtime override for sider toggles, immediately reflected in
+  // the layout component; kept separate so saves don't write every toggle,
+  // but still sync back to settings when `persistSiderCollapsed` is called.
   siderCollapsed: boolean;
   toggleSider: () => void;
+  // One-shot apply: updates runtime state + fires a settings patch. Used by
+  // MainLayout on mount so the sider default matches the saved preference.
+  seedFromSettings: (s: Pick<MainSystemGetSettingsResult, 'ui.compact' | 'ui.collapsed'>) => void;
+  persistSiderCollapsed: (collapsed: boolean) => Promise<void>;
+
   systemInfo: MainSystemInfoResult | null;
   systemHealth: MainSystemHealthResult | null;
   systemError: string | null;
@@ -165,8 +238,36 @@ export interface UiState {
   refreshHealth: () => Promise<void>;
 }
 export const useUiStore = create<UiState>((set, get) => ({
+  uiCompact: 0,
+  uiCollapsed: 0,
   siderCollapsed: false,
-  toggleSider: () => set({ siderCollapsed: !get().siderCollapsed }),
+  toggleSider: () => {
+    const next = !get().siderCollapsed;
+    set({ siderCollapsed: next });
+    // sync back to settings lazily so preference survives reload
+    void get().persistSiderCollapsed(next);
+  },
+  seedFromSettings: (s) => {
+    const compact =
+      typeof s['ui.compact'] === 'boolean' ? (s['ui.compact'] ? 1 : 0) : (s['ui.compact'] as 0 | 1) ?? 0;
+    const collapsed =
+      typeof s['ui.collapsed'] === 'boolean' ? (s['ui.collapsed'] ? 1 : 0) : (s['ui.collapsed'] as 0 | 1) ?? 0;
+    set({
+      uiCompact: compact,
+      uiCollapsed: collapsed,
+      siderCollapsed: collapsed === 1,
+    });
+  },
+  persistSiderCollapsed: async (collapsed) => {
+    try {
+      const final = await fmbApi.systemSetSettings({ 'ui.collapsed': collapsed ? 1 : 0 });
+      const val = typeof final['ui.collapsed'] === 'boolean'
+        ? (final['ui.collapsed'] ? 1 : 0)
+        : final['ui.collapsed'] ?? 0;
+      set({ uiCollapsed: val as 0 | 1 });
+    } catch { /* silent: user-facing collapse still worked */ }
+  },
+
   systemInfo: null,
   systemHealth: null,
   systemError: null,
@@ -174,8 +275,11 @@ export const useUiStore = create<UiState>((set, get) => ({
   loadSystem: async () => {
     set({ systemLoading: true, systemError: null });
     try {
-      const [info, health] = await Promise.all([fmbApi.systemInfo(), fmbApi.systemHealth()]);
+      const [info, health, settings] = await Promise.all([
+        fmbApi.systemInfo(), fmbApi.systemHealth(), fmbApi.systemGetSettings(),
+      ]);
       set({ systemInfo: info, systemHealth: health, systemLoading: false });
+      get().seedFromSettings(settings);
     } catch (e) {
       set({ systemLoading: false, systemError: (e as { message?: string }).message ?? 'Failed to load system info' });
     }
@@ -196,12 +300,29 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
   load: async () => {
     if (get().loading) return;
     set({ loading: true, error: null });
-    try { set({ loading: false, data: await fmbApi.systemGetSettings({}), ts: Date.now() }); }
-    catch (e) { set({ loading: false, error: (e as { message?: string }).message ?? 'Failed to load settings' }); }
+    try {
+      const data = await fmbApi.systemGetSettings({});
+      set({ loading: false, data, ts: Date.now() });
+      // Seed the UI store so layout/theme reacts *before* the next paint.
+      useUiStore.getState().seedFromSettings(data);
+    } catch (e) {
+      set({ loading: false, error: (e as { message?: string }).message ?? 'Failed to load settings' });
+    }
   },
   patch: async (patch) => {
     const result = await fmbApi.systemSetSettings(patch);
     set({ data: result, ts: Date.now() });
+    // Immediate UI side-effects for patched UI settings.
+    const sync: Partial<Pick<MainSystemGetSettingsResult, 'ui.compact' | 'ui.collapsed'>> = {};
+    if ('ui.compact' in patch || patch['ui.compact'] !== undefined) sync['ui.compact'] = result['ui.compact'];
+    if ('ui.collapsed' in patch || patch['ui.collapsed'] !== undefined) sync['ui.collapsed'] = result['ui.collapsed'];
+    if (Object.keys(sync).length > 0) {
+      const prev = useUiStore.getState();
+      useUiStore.getState().seedFromSettings({
+        ['ui.compact']: sync['ui.compact'] ?? prev.uiCompact,
+        ['ui.collapsed']: sync['ui.collapsed'] ?? prev.uiCollapsed,
+      });
+    }
     return result;
   },
 }));

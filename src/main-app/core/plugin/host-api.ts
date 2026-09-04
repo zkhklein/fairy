@@ -43,19 +43,24 @@ export interface HostApiServices {
   /**
    * App-plugins can create workflows via Host.workflows.create(). This
    * callback delegates to WorkflowService.create() inside the host process.
-   * Carried as a callback (instead of a cyclic import) so host-api.ts stays
-   * free of workflow-service references.
+   * Returns a Promise so the actual (synchronous better-sqlite3) DB
+   * operation is deferred to the main process event loop via
+   * process.nextTick — calling it synchronously inside a vm.Script sandbox
+   * async continuation crashes the native module (V8 context mismatch,
+   * 0xC0000005 access violation).
    */
-  onCreateWorkflow?: (args: { id?: string; name: string; description?: string; definition: Record<string, unknown>; vars?: Record<string, unknown>; owner_plugin_id?: string | null; }) => Record<string, unknown>;
+  onCreateWorkflow?: (args: { id?: string; name: string; description?: string; definition: Record<string, unknown>; vars?: Record<string, unknown>; owner_plugin_id?: string | null; }) => Promise<Record<string, unknown>>;
   onStartWorkflow?: (workflowId: string, input?: Record<string, unknown>) => Promise<{ runId: string; status: string }>;
   onGetWorkflow?: (id: string) => Record<string, unknown> | null;
   /**
    * App-plugins can create schedules via Host.schedules.create(). The actual
    * scheduling is performed by SchedulerService (cron) so plugins can't
    * overload the event loop with per-plugin setInterval loops.
+   * Returns a Promise — same process.nextTick deferral rationale as
+   * onCreateWorkflow above (prevents native module crash from sandbox).
    */
-  onCreateSchedule?: (args: { id?: string; name: string; cronExpr?: string; oneShotAtMs?: number; workflowId: string; input?: Record<string, unknown>; enabled?: boolean; owner_plugin_id: string; }) => Record<string, unknown>;
-  onToggleSchedule?: (id: string, enabled: boolean) => Record<string, unknown> | null;
+  onCreateSchedule?: (args: { id?: string; name: string; cronExpr?: string; oneShotAtMs?: number; workflowId: string; input?: Record<string, unknown>; enabled?: boolean; owner_plugin_id: string; }) => Promise<Record<string, unknown>>;
+  onToggleSchedule?: (id: string, enabled: boolean) => Promise<Record<string, unknown> | null>;
 }
 
 function notImplemented<T = never>(method: string): T {
@@ -152,7 +157,7 @@ export function buildHostApi(svc: HostApiServices): HostApi {
       if (!svc.onCreateWorkflow) {
         throw new Error('Host.workflows.create: host did not wire onCreateWorkflow callback');
       }
-      const created = svc.onCreateWorkflow({
+      const created = await svc.onCreateWorkflow({
         id: args.id,
         name: args.name,
         description: args.description,
@@ -186,7 +191,7 @@ export function buildHostApi(svc: HostApiServices): HostApi {
       if (!svc.onCreateSchedule) {
         throw new Error('Host.schedules.create: host did not wire onCreateSchedule callback');
       }
-      const created = svc.onCreateSchedule({
+      const created = await svc.onCreateSchedule({
         id: args.id,
         name: args.name,
         cronExpr: args.cron,
@@ -203,7 +208,7 @@ export function buildHostApi(svc: HostApiServices): HostApi {
         throw new Error('Host.schedules.toggle requires plugin context');
       }
       if (!svc.onToggleSchedule) return notImplemented('schedules.toggle(' + id + ')');
-      const r = svc.onToggleSchedule(id, !!enabled);
+      const r = await svc.onToggleSchedule(id, !!enabled);
       return r as unknown as ReturnType<HostApi['schedules']['toggle']>;
     },
   };

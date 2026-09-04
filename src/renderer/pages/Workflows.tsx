@@ -14,23 +14,16 @@ import React from 'react';
  * explaining that workflows are owned exclusively by app-type plugins.
  */
 import { Button, Space, Table, Tag, message, Tooltip, Empty } from 'antd';
-import { ReloadOutlined, PlusOutlined, PlayCircleOutlined, DeleteOutlined, AppstoreAddOutlined } from '@ant-design/icons';
+import { ReloadOutlined, PlayCircleOutlined, DeleteOutlined, AppstoreAddOutlined } from '@ant-design/icons';
 import { useEffect, useMemo } from 'react';
 import PageShell from '../components/PageShell';
 import { useWorkflowStore } from '../stores';
 import type { WorkflowViewModel } from '@shared/types';
 
 export default function Workflows(): JSX.Element {
-  const { loading, error, data, list, create, run, del } = useWorkflowStore();
+  const { loading, error, data, list, run, del } = useWorkflowStore();
 
   useEffect(() => { void list(); }, [list]);
-
-  const onCreateSample = async (): Promise<void> => {
-    // UI direct creation is forbidden (v3 ownership contract). Keep the
-    // clickable path so users still get explicit feedback instead of a
-    // silently disabled button.
-    message.warning('工作流归应用插件（app 类型）所有。请从对应应用插件的子页面内创建工作流。');
-  };
 
   const onRun = async (id: string): Promise<void> => {
     try {
@@ -143,11 +136,6 @@ export default function Workflows(): JSX.Element {
         <Space>
           <Tag color="blue">{(data?.total ?? 0).toString()} 个工作流</Tag>
           <Button onClick={() => void list()} icon={<ReloadOutlined />}>刷新</Button>
-          <Tooltip title="工作流归应用插件所有，不再允许 UI 直接创建。请从 app 插件的子页面里调用 host.workflows.create(...)。">
-            <Button type="primary" disabled icon={<PlusOutlined />} onClick={onCreateSample}>
-              创建示例
-            </Button>
-          </Tooltip>
         </Space>
       }
     >

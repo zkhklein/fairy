@@ -229,19 +229,19 @@ export default function Settings(): JSX.Element {
                   </Form.Item>
                 </Col>
               </Row>
-              <Form.Item name="system.autoStart" label="开机自启" valuePropName="checked">
+              <Form.Item name="system.autoStart" label="开机自启" valuePropName="checked" getValueProps={(val) => ({ checked: !!val && val !== 0 })}>
                 <Switch checkedChildren="开" unCheckedChildren="关" />
               </Form.Item>
 
               <Divider orientation="left" plain>界面</Divider>
               <Row gutter={16}>
                 <Col span={12}>
-                  <Form.Item name="ui.compact" label="紧凑模式" valuePropName="checked">
+                  <Form.Item name="ui.compact" label="紧凑模式" valuePropName="checked" getValueProps={(val) => ({ checked: !!val && val !== 0 })}>
                     <Switch checkedChildren="开" unCheckedChildren="关" />
                   </Form.Item>
                 </Col>
                 <Col span={12}>
-                  <Form.Item name="ui.collapsed" label="侧边栏默认折叠" valuePropName="checked">
+                  <Form.Item name="ui.collapsed" label="侧边栏默认折叠" valuePropName="checked" getValueProps={(val) => ({ checked: !!val && val !== 0 })}>
                     <Switch checkedChildren="开" unCheckedChildren="关" />
                   </Form.Item>
                 </Col>

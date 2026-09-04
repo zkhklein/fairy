@@ -58,6 +58,35 @@ const zJsonArr = z.string().default('[]').describe('JSON array serialised as TEX
 const zUnixMs = z.number().int().nonnegative().describe('Unix epoch milliseconds');
 const zUnixMsNullable = zUnixMs.nullish();
 
+// ---------- Schedule template (manifest-declared user-facing schedule blueprints) ----------
+// Used by UI "Add Schedule" Modal → Tab1: pick an App plugin → pick one of
+// its declared scheduleTemplates → fill template.paramsSchema Form → submit.
+// `targetWorkflowId` is optional: when absent the UI asks the user to pick a
+// workflow owned by the app plugin.
+export const ScheduleTemplateParamSchema = z.object({
+  label: z.string().min(1),
+  description: z.string().max(500).default(''),
+  type: z.enum(['string', 'number', 'boolean', 'select']),
+  required: z.boolean().default(false),
+  defaultValue: z.unknown().optional(),
+  options: z.array(z.object({ label: z.string(), value: z.unknown() })).optional(),
+  placeholder: z.string().max(200).optional(),
+});
+export type ScheduleTemplateParam = z.infer<typeof ScheduleTemplateParamSchema>;
+
+export const ScheduleTemplateSchema = z.object({
+  id: z.string().min(1).max(64),
+  label: z.string().min(1).max(128),
+  description: z.string().max(1000).default(''),
+  defaultCron: z.string().min(1).optional(),
+  defaultOneShotMsOffset: z.number().int().nonnegative().optional(),
+  defaultName: z.string().min(1).optional(),
+  targetWorkflowId: z.string().min(1).optional(),
+  misfirePolicy: z.enum(['run_now', 'skip', 'last_missed']).optional(),
+  paramsSchema: z.record(z.string(), ScheduleTemplateParamSchema).default({}),
+});
+export type ScheduleTemplate = z.infer<typeof ScheduleTemplateSchema>;
+
 // ---------- Plugin manifest schema (zip package.json style, used BEFORE install) ----------
 export const PluginManifestSchema = z
   .object({
@@ -71,6 +100,7 @@ export const PluginManifestSchema = z
     main: z.string().min(1),
     renderer: z.string().optional(),
     extensionPoints: z.array(z.string()).default([]),
+    scheduleTemplates: z.array(ScheduleTemplateSchema).default([]),
   })
   .strict();
 export type PluginManifest = z.infer<typeof PluginManifestSchema>;
@@ -267,6 +297,8 @@ export const PluginViewModelSchema = PluginSchema.extend({
   permissions: z.array(z.string()),
   dependencies: z.record(z.string(), z.string()),
   manifest: z.record(z.string(), z.unknown()),
+  // Parsed from manifest_json at API boundary so renderers never JSON.parse TEXT.
+  scheduleTemplates: z.array(ScheduleTemplateSchema).default([]),
 });
 export type PluginViewModel = z.infer<typeof PluginViewModelSchema>;
 

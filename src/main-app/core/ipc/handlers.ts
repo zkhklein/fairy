@@ -17,13 +17,14 @@
  * This file is intentionally lightweight: it wires channels to services,
  * keeping each handler < ~10 LOC to keep bug surface tiny.
  */
-import { ipcMain } from 'electron';
+import { ipcMain, dialog, type BrowserWindow } from 'electron';
 import { app } from 'electron';
 import os from 'node:os';
 import {
   IPC_REGISTRY,
   main_plugin_list, main_plugin_get, main_plugin_install, main_plugin_setStatus,
   main_plugin_uninstall, main_plugin_validateManifest, main_plugin_listVersions, main_plugin_switchVersion,
+  main_plugin_preInstallCheck, main_plugin_installBatch, main_plugin_listScheduleTemplates,
   main_workflow_list, main_workflow_get, main_workflow_create, main_workflow_update,
   main_workflow_delete, main_workflow_runStart, main_workflow_runCancel, main_workflow_runList, main_workflow_exportJson,
   main_schedule_list, main_schedule_create, main_schedule_toggle, main_schedule_delete,
@@ -33,7 +34,9 @@ import {
   main_system_info, main_system_health, main_system_getSettings, main_system_setSettings,
   main_ep_list,
   main_plugin_getRenderer, main_plugin_callAction,
+  main_dialog_showOpen,
   type IpcChannel,
+  type MainPluginListScheduleTemplatesResult,
 } from '@shared/ipc';
 import type { z } from 'zod';
 import { nanoid } from 'nanoid';
@@ -45,9 +48,10 @@ import { QueueService } from '../queue/service';
 import { ErrorCalendarService } from '../error-calendar/service';
 import { getEventBus } from '../event-bus';
 import { getRawDb } from '../db';
-import { createLogger } from '../logger';
+import { createLogger, setGlobalLogLevel } from '../logger';
 import { getSettingsService } from '../settings/service';
 import { EXTENSION_POINTS } from '../event-bus/extension-points';
+import type { PluginManifest } from '@shared/types';
 
 const log = createLogger('ipc');
 
@@ -62,6 +66,10 @@ interface IpcRegistry {
   logsDir: string;
   pluginsDir: string;
   epDescriptions?: Partial<Record<string, string>>;
+  // Main BrowserWindow reference (needed for modal dialog parent binding so
+  // the dialog doesn't surface behind the window on Windows). Pass undefined
+  // in tests; the dialog call uses null as parent in that case.
+  mainWindow?: BrowserWindow | null;
 }
 
 /**
@@ -198,6 +206,59 @@ export function registerIpcHandlers(ctx: IpcRegistry): () => void {
     if (!r.ok) throw pluginError(r.error, 'SWITCH_VERSION_FAILED');
     return pluginSvc.get(p.id);
   });
+  // Dry-run per-zip install preview
+  wire(main_plugin_preInstallCheck, async (p) => {
+    const r = await pluginSvc.preInstallCheckFromZip(p.zipPath);
+    return {
+      ok: r.ok,
+      zipPath: p.zipPath,
+      manifest: r.manifest,
+      versionStatus: r.versionStatus,
+      installedVersion: r.installedVersion,
+      depCheck: r.depCheck,
+      errors: r.errors,
+    };
+  });
+  // Batch install + optional auto-enable. Results returned per zip,
+  // individual failures never abort the remaining batch.
+  wire(main_plugin_installBatch, async (p) => pluginSvc.installBatch({ zipPaths: p.zipPaths, autoEnable: !!p.autoEnable }));
+  // Enabled app plugins that declare at least one scheduleTemplate.
+  wire(main_plugin_listScheduleTemplates, () => {
+    const rows = db.prepare(`
+      SELECT p.id, p.name, p.status, pv.manifest_json
+        FROM plugins p
+        JOIN plugin_versions pv ON pv.plugin_id = p.id
+                                 AND pv.version = p.current_version
+       WHERE p.type = 'app' AND p.status = 'enabled'
+    `).all() as Array<{ id: string; name: string; status: string; manifest_json: string }>;
+    const items: MainPluginListScheduleTemplatesResult['items'] = [];
+    for (const r of rows) {
+      let manifest: PluginManifest | null = null;
+      try { manifest = JSON.parse(r.manifest_json) as PluginManifest; } catch { continue; }
+      if (!manifest?.scheduleTemplates || manifest.scheduleTemplates.length === 0) continue;
+      items.push({ pluginId: r.id, pluginName: r.name, templates: manifest.scheduleTemplates });
+    }
+    return { items };
+  });
+
+  // Native OS open-file dialog. Binding the BrowserWindow as parent avoids
+  // Windows opening the picker as a background/taskbar-flashing-only window.
+  wire(main_dialog_showOpen, async (p) => {
+    const properties: Array<'openFile' | 'openDirectory' | 'multiSelections'> = [];
+    if (p.openFile) properties.push('openFile');
+    if (p.openDirectory) properties.push('openDirectory');
+    if (p.multiSelections) properties.push('multiSelections');
+    if (properties.length === 0) properties.push('openFile');
+    const win = ctx.mainWindow && !ctx.mainWindow.isDestroyed() ? ctx.mainWindow : undefined;
+    const result = await dialog.showOpenDialog(win as any, {
+      title: p.title,
+      defaultPath: p.defaultPath,
+      buttonLabel: p.buttonLabel,
+      filters: p.filters as Array<{ name: string; extensions: string[] }>,
+      properties,
+    });
+    return { canceled: result.canceled, filePaths: result.filePaths };
+  });
 
   // T12-B/C: plugin renderer bundle + callAction
   wire(main_plugin_getRenderer, (p) => {
@@ -262,19 +323,40 @@ export function registerIpcHandlers(ctx: IpcRegistry): () => void {
 
   // ---- Schedules ----
   wire(main_schedule_list, (p) => scheduler.list(p));
-  wire(main_schedule_create, (p) => {
-    // Translate IPC snake_case/camelCase aliases → CreateScheduleArgs (camelCase)
-    const input_json = p.input_json ?? (p.input ? JSON.stringify(p.input) : '{}');
-    return scheduler.create({
+  wire(main_schedule_create, async (p) => {
+    const input_json = p.input_json ?? (p.input ? JSON.stringify(p.input) : (p.params ? JSON.stringify(p.params) : '{}'));
+    const workflowId = p.workflowId ?? p.workflow_id ?? undefined;
+    if (!workflowId) {
+      throw Object.assign(new Error('缺少 workflowId：请先选择/创建一个工作流。'), {
+        code: 'MISSING_WORKFLOW_ID',
+        status: 400,
+      });
+    }
+    const base = {
       name: p.name,
       cronExpr: p.cronExpr ?? p.cron_expr ?? undefined,
       oneShotAtMs: p.oneShotAtMs ?? p.one_shot_at ?? undefined,
-      workflowId: p.workflowId ?? p.workflow_id ?? `wf-placeholder-${nanoid(6)}`,
+      workflowId,
       input: input_json ? JSON.parse(input_json) : {},
       enabled: p.enabled === 1,
       misfirePolicy: p.misfirePolicy ?? p.misfire_policy ?? 'skip',
       timezone: p.timezone ?? 'UTC',
-    });
+    };
+    // v3 ownership contract: when `owner_plugin_id` is provided, first
+    // validate the plugin is an *enabled* app-type plugin — this serves the
+    // same purpose as the Host.schedules.create self-identity check. There is
+    // no owner column on the `schedules` table today, so we gate at creation
+    // time and let the scheduler/database execute it normally.
+    if (p.owner_plugin_id) {
+      const plug = pluginSvc.get(p.owner_plugin_id);
+      if (!plug || plug.type !== 'app' || plug.status !== 'enabled') {
+        throw Object.assign(
+          new Error(`owner_plugin_id="${p.owner_plugin_id}" 不是已启用的 app 插件，拒绝创建定时任务。`),
+          { code: 'OWNER_NOT_APP_PLUGIN', status: 400 },
+        );
+      }
+    }
+    return scheduler.create(base);
   });
   wire(main_schedule_toggle, (p) => scheduler.toggle(p.id, p.enabled === 1));
   wire(main_schedule_delete, (p) => { scheduler.delete(p.id); return { ok: true as const }; });
@@ -357,9 +439,40 @@ export function registerIpcHandlers(ctx: IpcRegistry): () => void {
   const settingsSvc = getSettingsService();
   wire(main_system_getSettings, () => settingsSvc.getAll());
   wire(main_system_setSettings, (p) => {
-    const final = settingsSvc.applyPatch(p);
-    // Apply immediate side-effects for keys that require it
-    if ((p as any)['queue.concurrency'] !== undefined) queue.setConcurrency(final['queue.concurrency']);
+    const patchKeys = Object.keys(p);
+    // `p` is Zod-parsed via params schema (which uses boolOrBit transforms).
+    // The Zod output type still hints at `boolean | 0 | 1` but transform
+    // guarantees `0 | 1` for those keys. Cast for `applyPatch` typing.
+    const patch = p as unknown as Partial<Record<string, unknown>>;
+    const final = settingsSvc.applyPatch(patch);
+    // Immediate side-effects on relevant key changes.
+    if (patchKeys.includes('queue.concurrency')) {
+      queue.setConcurrency(final['queue.concurrency']);
+    }
+    if (patchKeys.includes('log.level')) {
+      setGlobalLogLevel(final['log.level']);
+    }
+    if (patchKeys.includes('system.autoStart')) {
+      try {
+        const open = final['system.autoStart'] === 1;
+        app.setLoginItemSettings({
+          openAtLogin: open,
+          path: app.getPath('exe'),
+        });
+        log.info({ openAtLogin: open }, 'auto-start preference applied');
+      } catch (e) {
+        log.warn({ err: (e as Error).message }, 'failed to apply auto-start setting');
+      }
+    }
+    // Broadcast change to renderer so the UI can re-seed settings without
+    // a reload (used by ThemeWrapper for compact mode, MainLayout for
+    // collapsed sider, Settings page for live-updated values).
+    try {
+      const win = ctx.mainWindow;
+      if (win && !win.isDestroyed()) {
+        win.webContents.send('fmb:settingsChanged', { keys: patchKeys });
+      }
+    } catch { /* silent — no window during CLI / early boot */ }
     return final;
   });
 
