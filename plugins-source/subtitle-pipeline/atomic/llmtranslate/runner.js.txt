@@ -115,6 +115,7 @@
     var meta = findHttpMeta(P.fmbDataDir);
     if (!meta) throw fatal('找不到 FMB HTTP 元信息（.fmb-http.json）');
     var entries = parseSrt(fs.readFileSync(P.srtPath, 'utf8'));
+    var origTexts = entries.map(function (e) { return e.text; });
     /* 零条目 srt 合法（全静音媒体）：写空 translated.srt 并直接报告成功，不取 key、不调 LLM */
     if (!entries.length) {
       var emptyPath = path.join(P.workDir, 'translated.srt');
@@ -136,7 +137,7 @@
       var userParts = [];
       if (glossary) userParts.push('【术语表/参考资料】\n' + glossary);
       if (ci > 0) {
-        var ctxLines = entries.slice(Math.max(0, offset - 2), offset).map(function (e) { return e.text.replace(/\s+/g, ' '); });
+        var ctxLines = origTexts.slice(Math.max(0, offset - 2), offset).map(function (t) { return t.replace(/\s+/g, ' '); });
         if (ctxLines.length) userParts.push('【上下文】\n' + ctxLines.join('\n'));
       }
       userParts.push('【原文】\n' + numbered);
