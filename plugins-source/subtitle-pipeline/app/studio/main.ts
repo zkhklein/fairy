@@ -1,7 +1,8 @@
 /* global hostApi, __hostEnv */
 // @ts-nocheck
 
-var WF_ID = 'wf-subtitle-flow';
+var WF_BASE = 'wf-subtitle-flow';
+var _wfId = null; /* 当前生效的工作流 id（definition 演进时换新版本 id，HostApi 无 workflow update） */
 var TASKS_KEY = 'tasks';
 var _running = false;
 var _timer = null;
@@ -23,9 +24,6 @@ function _finalPathFor(mediaPath) {
 }
 
 async function _ensureWorkflow() {
-  var existing = null;
-  try { existing = await hostApi.workflows.get(WF_ID); } catch (_) { existing = null; }
-  if (existing) return;
   var def = {
     nodes: [
       { id: 'asr', type: 'atomic', pluginId: 'com.fmb.subtitle.asr', action: 'transcribe',
@@ -33,17 +31,37 @@ async function _ensureWorkflow() {
       { id: 'translate', type: 'atomic', pluginId: 'com.fmb.subtitle.llmtranslate', action: 'translateSrt',
         inputs: { taskId: '${input.taskId}', srtPath: '${nodes.asr.output.srtPath}', sourceLang: '${nodes.asr.output.detectedLanguage}', workDir: '${input.workDir}' } },
       { id: 'write', type: 'atomic', pluginId: 'com.fmb.subtitle.writer', action: 'emit',
-        inputs: { taskId: '${input.taskId}', mediaPath: '${input.mediaPath}', translatedSrtPath: '${nodes.translate.output.translatedSrtPath}', workDir: '${input.workDir}' } },
+        inputs: { taskId: '${input.taskId}', mediaPath: '${input.mediaPath}', translatedSrtPath: '${nodes.translate.output.translatedSrtPath}', rawSrtPath: '${nodes.asr.output.srtPath}', sourceLang: '${nodes.asr.output.detectedLanguage}', workDir: '${input.workDir}' } },
     ],
     edges: [{ source: 'asr', target: 'translate' }, { source: 'translate', target: 'write' }],
     entryNode: 'asr',
     vars: {},
   };
+  var defJson = JSON.stringify(def);
+  /*
+   * HostApi 只有 workflows.create/start/get（无 update/delete），definition 演进只能换 id：
+   * 从 v1 起扫现有版本，definition 完全一致的直接复用；全不一致则建新版本号 id
+   * （旧版本记录残留但无害——不会被 start 引用）。
+   */
+  var maxV = 0;
+  for (var v = 1; v <= 20; v++) {
+    var id = v === 1 ? WF_BASE : WF_BASE + '-v' + v;
+    var wf = null;
+    try { wf = await hostApi.workflows.get(id); } catch (_) { wf = null; }
+    if (!wf) break;
+    var same = false;
+    try { same = JSON.stringify(wf.definition) === defJson; } catch (_) {}
+    if (same) { _wfId = id; return; }
+    maxV = v;
+  }
+  var newId = maxV === 0 ? WF_BASE : WF_BASE + '-v' + (maxV + 1);
   try {
-    await hostApi.workflows.create({ id: WF_ID, name: '字幕提取翻译流水线', description: 'whisper 转写 → LLM 翻译 → 写出 .zh.srt 到媒体同目录', definition: def });
-    hostApi.logger.info('studio: workflow created', { id: WF_ID });
+    await hostApi.workflows.create({ id: newId, name: '字幕提取翻译流水线', description: 'whisper 转写 → LLM 翻译 → 写出 .zh.srt（附原语言 .<lang>.srt）到媒体同目录', definition: def });
+    _wfId = newId;
+    hostApi.logger.info('studio: workflow created', { id: newId });
   } catch (e) {
-    hostApi.logger.info('studio: workflow already exists', { error: e && e.message });
+    hostApi.logger.warn('studio: workflow create failed, falling back to latest existing', { error: e && e.message });
+    _wfId = maxV === 0 ? WF_BASE : WF_BASE + '-v' + maxV;
   }
 }
 
@@ -54,7 +72,7 @@ async function _runTask(task) {
   me.status = 'asr'; me.progressText = '排队启动…'; me.error = '';
   await _saveTasks(tasks);
   try {
-    var r = await hostApi.workflows.start(WF_ID, {
+    var r = await hostApi.workflows.start(_wfId || WF_BASE, {
       taskId: me.taskId, mediaPath: me.mediaPath, language: me.language || 'auto',
       workDir: _dataRoot() + '\\subtitle-tasks\\' + me.taskId,
     });

@@ -92,8 +92,16 @@ module.exports = {
     var rawPath = payload.workDir + '\\raw.srt';
 
     if (await _fileExists(rawPath)) {
-      hostApi.logger.info('asr: raw.srt exists, reuse', { taskId: taskId });
-      return { ok: true, srtPath: rawPath, detectedLanguage: language !== 'auto' ? language : '', durationMs: 0, reused: true };
+      /* 复用已完成转写：语言从上次终态结果恢复（auto 模式下检测值只在首跑 KV 里） */
+      var lang = language !== 'auto' ? language : '';
+      if (!lang) {
+        try {
+          var prev = await hostApi.kv.get('asrResult:' + taskId);
+          if (prev) { var pr = JSON.parse(prev); if (pr && pr.detectedLanguage) lang = pr.detectedLanguage; }
+        } catch (_) {}
+      }
+      hostApi.logger.info('asr: raw.srt exists, reuse', { taskId: taskId, lang: lang });
+      return { ok: true, srtPath: rawPath, detectedLanguage: lang, durationMs: 0, reused: true };
     }
 
     await hostApi.kv.delete('asrResult:' + taskId);
@@ -115,7 +123,7 @@ module.exports = {
       if (raw) {
         var r = JSON.parse(raw);
         if (!r.ok) throw new Error('asr: ' + (r.error || 'unknown'));
-        return { ok: true, srtPath: r.srtPath, detectedLanguage: r.detectedLanguage || (language !== 'auto' ? language : 'ja'), durationMs: r.durationMs };
+        return { ok: true, srtPath: r.srtPath, detectedLanguage: r.detectedLanguage || (language !== 'auto' ? language : ''), durationMs: r.durationMs };
       }
       var beat = await hostApi.kv.get('asrProgress:' + taskId);
       if (beat) lastBeat = Math.max(lastBeat, parseInt(beat, 10) || lastBeat);

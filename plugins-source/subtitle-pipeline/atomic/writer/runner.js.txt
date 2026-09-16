@@ -50,11 +50,23 @@
     /* 空 srt 合法（全静音媒体）：仍写出空 .zh.srt 并报告 empty:true；非空条目仍校验 text 非空 */
     for (var i = 0; i < entries.length; i++) if (!entries[i].text.trim()) throw new Error('第 ' + (i + 1) + ' 条译文为空');
     var stem = path.basename(P.mediaPath).replace(/\.[^.]+$/, '');
-    var finalPath = path.join(path.dirname(P.mediaPath), stem + '.zh.srt');
+    var mediaDir = path.dirname(P.mediaPath);
+    var finalPath = path.join(mediaDir, stem + '.zh.srt');
     fs.writeFileSync(finalPath, entries.length ? formatSrt(entries) : '', 'utf8');
-    try { fs.rmSync(P.workDir, { recursive: true, force: true }); } catch (_) {}
     var result = { ok: true, finalPath: finalPath, entries: entries.length };
     if (!entries.length) result.empty = true;
+    /* 原语言字幕一并落盘：raw.srt → <stem>.<lang>.srt（lang 缺省用 orig）。必须在删 workDir 之前复制 */
+    if (P.rawSrtPath && fs.existsSync(P.rawSrtPath)) {
+      var lang = (P.sourceLang && P.sourceLang !== 'auto') ? P.sourceLang : 'orig';
+      var origPath = path.join(mediaDir, stem + '.' + lang + '.srt');
+      try {
+        var rawText = fs.readFileSync(P.rawSrtPath, 'utf8');
+        fs.writeFileSync(origPath, rawText.replace(/^﻿/, '').replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/\n/g, '\r\n'), 'utf8');
+        result.origPath = origPath;
+        result.origLang = lang;
+      } catch (e2) { console.error('orig srt copy failed: ' + (e2 && e2.message)); }
+    }
+    try { fs.rmSync(P.workDir, { recursive: true, force: true }); } catch (_) {}
     console.log(JSON.stringify(result));
     done(result);
   } catch (e) {

@@ -41,6 +41,7 @@ module.exports = {
 
     var script = runnerSrc.replace('/*__FMB_PARAMS__*/', 'var P = ' + JSON.stringify({
       taskId: taskId, mediaPath: payload.mediaPath, translatedSrtPath: payload.translatedSrtPath,
+      rawSrtPath: payload.rawSrtPath || '', sourceLang: payload.sourceLang || '',
       workDir: payload.workDir, fmbDataDir: _dataRoot(), callbackPluginId: 'com.fmb.subtitle.writer',
     }) + ';');
 
@@ -52,7 +53,7 @@ module.exports = {
       if (raw) {
         var r = JSON.parse(raw);
         if (!r.ok) throw new Error('writer: ' + (r.error || 'unknown'));
-        return { ok: true, finalPath: r.finalPath, entries: r.entries };
+        return { ok: true, finalPath: r.finalPath, entries: r.entries, origPath: r.origPath || '', origLang: r.origLang || '' };
       }
       await new Promise(function (rs) { setTimeout(rs, 1000); });
     }
