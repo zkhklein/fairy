@@ -130,36 +130,52 @@
     var glossary = loadGlossary();
     var src = ({ ja: '日语', en: '英语' })[P.sourceLang] || '外语';
     var chunks = chunkEntries(entries, 25, 1500);
-    var totalTokens = 0;
-    for (var ci = 0; ci < chunks.length; ci++) {
-      var chunk = chunks[ci], offset = entries.indexOf(chunk[0]);
-      var numbered = chunk.map(function (e, i) { return '«' + (offset + i + 1) + '» ' + e.text.replace(/\s+/g, ' '); }).join('\n');
+    /*
+     * 翻译 [offset, offset+count) 区间的条目，返回译文数组（长度 = count）。
+     * 契约重试 3 次失败后二分拆小重试（递归，直到单行——单行块无相邻行可合并，
+     * 行数契约不可能不符）。真实素材的 whisper 碎片行会诱发大模型并句（E2E 后
+     * 又在真实 mp3 上复现：expect 25 got 23），二分是兜底恢复路径。
+     */
+    async function translateRange(offset, count, ci, depth, tokenBox) {
+      var numbered = '';
+      for (var i = 0; i < count; i++) numbered += (i ? '\n' : '') + '«' + (offset + i + 1) + '» ' + entries[offset + i].text.replace(/\s+/g, ' ');
+      var ctxLines = origTexts.slice(Math.max(0, offset - 2), offset).map(function (t) { return t.replace(/\s+/g, ' '); });
       var userParts = [];
       if (glossary) userParts.push('【术语表/参考资料】\n' + glossary);
-      if (ci > 0) {
-        var ctxLines = origTexts.slice(Math.max(0, offset - 2), offset).map(function (t) { return t.replace(/\s+/g, ' '); });
-        if (ctxLines.length) userParts.push('【上下文】\n' + ctxLines.join('\n'));
-      }
+      if (offset > 0 && ctxLines.length) userParts.push('【上下文】\n' + ctxLines.join('\n'));
       userParts.push('【原文】\n' + numbered);
       var messages = [{ role: 'system', content: buildSystem(src) }, { role: 'user', content: userParts.join('\n\n') }];
       var translated = null, lastErr = null;
       for (var attempt = 0; attempt < 3 && !translated; attempt++) {
         try {
           var temp = attempt === 0 ? 0.3 : 0.15;
-          var msgs = attempt === 0 ? messages : messages.concat([{ role: 'user', content: '上次输出行数不符。必须严格逐行输出 «i» 译文，共 ' + chunk.length + ' 行。' }]);
+          var msgs = attempt === 0 ? messages : messages.concat([{ role: 'user', content: '上次输出行数不符。必须严格逐行输出 «i» 译文，共 ' + count + ' 行，不得合并相邻行。' }]);
           var r = await callWithRetry(cfg, msgs, temp);
-          totalTokens += (r.usage && r.usage.total_tokens) || 0;
+          tokenBox.total += (r.usage && r.usage.total_tokens) || 0;
           var map = parseNumbered(r.content);
           var lines = [], ok = true;
-          for (var k = 0; k < chunk.length; k++) { var v = map[offset + k + 1]; if (!v) { ok = false; break; } lines.push(v); }
-          if (ok) translated = lines; else lastErr = new Error('行数不符: expect ' + chunk.length + ' got ' + Object.keys(map).length);
+          for (var k = 0; k < count; k++) { var v = map[offset + k + 1]; if (!v) { ok = false; break; } lines.push(v); }
+          if (ok) translated = lines; else lastErr = new Error('行数不符: expect ' + count + ' got ' + Object.keys(map).length);
         } catch (e) { lastErr = e; }
       }
-      if (!translated) throw fatal('块 ' + (ci + 1) + '/' + chunks.length + ' 翻译失败: ' + (lastErr && lastErr.message));
+      if (translated) return translated;
+      if (count <= 1 || depth >= 6) throw fatal('块 ' + (ci + 1) + '/' + chunks.length + ' 翻译失败: ' + (lastErr && lastErr.message));
+      console.error('split retry: block ' + (ci + 1) + ' lines ' + (offset + 1) + '-' + (offset + count) + ' depth ' + depth + ' (' + (lastErr && lastErr.message) + ')');
+      var mid = Math.floor(count / 2);
+      var a = await translateRange(offset, mid, ci, depth + 1, tokenBox);
+      await postInvoke(meta, P.callbackPluginId, 'storeProgress', { taskId: P.taskId, ts: Date.now() });
+      var b = await translateRange(offset + mid, count - mid, ci, depth + 1, tokenBox);
+      return a.concat(b);
+    }
+    var tokenBox = { total: 0 };
+    for (var ci = 0; ci < chunks.length; ci++) {
+      var chunk = chunks[ci], offset = entries.indexOf(chunk[0]);
+      var translated = await translateRange(offset, chunk.length, ci, 0, tokenBox);
       for (var k2 = 0; k2 < chunk.length; k2++) chunk[k2].text = translated[k2];
       await postInvoke(meta, P.studioPluginId, 'storeProgress', { taskId: P.taskId, stage: 'translating', text: '翻译中 · 块 ' + (ci + 1) + '/' + chunks.length });
       await postInvoke(meta, P.callbackPluginId, 'storeProgress', { taskId: P.taskId, ts: Date.now() });
     }
+    var totalTokens = tokenBox.total;
     var outPath = path.join(P.workDir, 'translated.srt');
     fs.writeFileSync(outPath, formatSrt(entries), 'utf8');
     console.log(JSON.stringify({ ok: true, translatedSrtPath: outPath, lineCount: entries.length, chunks: chunks.length, tokens: totalTokens }));

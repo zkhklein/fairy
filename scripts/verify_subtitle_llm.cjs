@@ -1,4 +1,4 @@
-/* llm runner 验收：内置 mock（FMB invoke + DeepInfra），验证分块/契约重试/落盘 */
+/* llm runner 验收：内置 mock（FMB invoke + DeepInfra），验证分块/契约重试/二分拆块/落盘 */
 const fs = require('fs'), path = require('path'), os = require('os'), http = require('http'), { spawn } = require('child_process');
 
 const ROOT = path.resolve(__dirname, '..');
@@ -23,6 +23,12 @@ const server = http.createServer((req, res) => {
       seenChunks.push(nums.length);
       const isChunk2 = nums.length > 0 && nums[0] === 26; /* 第 2 块覆盖 1-based 序号 26..50 */
       if (isChunk2 && ++chunk2Attempts === 1) { res.end(JSON.stringify({ choices: [{ message: { content: '«1» 坏行' } }] })); return; } /* 契约违反→触发重试 */
+      const isFullChunk3 = nums.length === 10 && nums[0] === 51; /* 第 3 块（51..60）整块永久并句：expect 10 got 8 → 二分拆块路径 */
+      if (isFullChunk3) {
+        const partial = nums.slice(0, 8).map(n => '«' + n + '» 译文' + n).join('\n');
+        res.end(JSON.stringify({ choices: [{ message: { content: partial } }], usage: { total_tokens: 100 } }));
+        return;
+      }
       res.end(JSON.stringify({ choices: [{ message: { content: nums.map(n => '«' + n + '» 译文' + n).join('\n') } }], usage: { total_tokens: 100 } }));
       return;
     }
@@ -55,6 +61,9 @@ server.listen(0, '127.0.0.1', () => {
     const srt = fs.readFileSync(path.join(workDir, 'translated.srt'), 'utf8');
     if (!srt.includes('译文60')) { console.error('FAIL: missing last entry'); process.exit(1); }
     if (chunk2Attempts < 2) { console.error('FAIL: contract retry not exercised'); process.exit(1); }
+    if (!seenChunks.includes(5)) { console.error('FAIL: split retry not exercised (no 5-line sub-chunk seen)'); process.exit(1); }
+    const m3 = (srt.match(/译文5[1-9]|译文60/g) || []).length;
+    if (m3 < 10) { console.error('FAIL: chunk-3 lines missing after split retry: ' + m3); process.exit(1); }
     if (seenChunks.length < 3) { console.error('FAIL: expected >=3 chunks (60 条 / 25) + retry'); process.exit(1); }
     console.log('PASS llm runner, chunks=' + JSON.stringify(seenChunks) + ' chunk2Attempts=' + chunk2Attempts);
     process.exit(0);
