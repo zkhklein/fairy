@@ -18,6 +18,10 @@ module.exports = {
 
   async setConfig(payload) {
     if (!payload) return { ok: true };
+    /* apiKey 存本插件 secrets（secrets 按插件隔离；studio.setConfig 会转发过来） */
+    if (typeof payload.apiKey === 'string' && payload.apiKey.trim()) {
+      await hostApi.secrets.set('deepinfra_api_key', payload.apiKey.trim(), 'DeepInfra API Key');
+    }
     if (typeof payload.nodePath === 'string') await hostApi.kv.set('config:nodePath', payload.nodePath.trim());
     if (typeof payload.apiBase === 'string') await hostApi.kv.set('config:apiBase', payload.apiBase.trim());
     if (typeof payload.model === 'string') await hostApi.kv.set('config:model', payload.model.trim());
@@ -40,7 +44,9 @@ module.exports = {
   /* runner 经 localhost invoke 自取 key（不落盘/不上命令行） */
   async getApiKey() {
     var s = await hostApi.secrets.get('deepinfra_api_key');
-    return { key: s && s.value ? s.value : null };
+    /* 契约是 {value}，但旧宿主实现直接返回裸字符串 —— 两种形状都兼容 */
+    var v = s ? (typeof s === 'string' ? s : s.value) : null;
+    return { key: v || null };
   },
 
   async storeResult(payload) {

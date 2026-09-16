@@ -126,7 +126,7 @@
     }
     var keyRes = await invokeGet(meta, P.callbackPluginId, 'getApiKey', {});
     if (!keyRes || !keyRes.key) throw fatal('未配置 DeepInfra API Key（在 Studio 配置页填写）');
-    var cfg = { apiKey: keyRes.key, apiBase: P.apiBase || 'https://api.deepinfra.com/v1/openai', model: P.model || 'Qwen/Qwen3-30B-A3B' };
+    var cfg = { apiKey: keyRes.key, apiBase: P.apiBase || 'https://api.deepinfra.com/v1/openai', model: P.model || 'Qwen/Qwen2.5-72B-Instruct' };
     var glossary = loadGlossary();
     var src = ({ ja: '日语', en: '英语' })[P.sourceLang] || '外语';
     var chunks = chunkEntries(entries, 25, 1500);

@@ -140,12 +140,16 @@ module.exports = {
 
   async getConfig() {
     var key = await hostApi.secrets.get('deepinfra_api_key');
-    return { ok: true, hasApiKey: !!(key && key.value) };
+    /* 兼容旧宿主：secrets.get 可能返回裸字符串而非 {value} */
+    return { ok: true, hasApiKey: !!(key && (typeof key === 'string' ? key : key.value)) };
   },
 
   async setConfig(payload) {
     if (payload && typeof payload.apiKey === 'string' && payload.apiKey.trim()) {
-      await hostApi.secrets.set('deepinfra_api_key', payload.apiKey.trim(), 'DeepInfra API Key for subtitle translation');
+      var key = payload.apiKey.trim();
+      await hostApi.secrets.set('deepinfra_api_key', key, 'DeepInfra API Key for subtitle translation');
+      /* secrets 按插件隔离：转发给实际取 key 的 llmtranslate（其 getApiKey 读自己的 secrets） */
+      await hostApi.plugins.invoke({ pluginId: 'com.fmb.subtitle.llmtranslate', method: 'setConfig', payload: { apiKey: key } });
     }
     return { ok: true };
   },

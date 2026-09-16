@@ -51,7 +51,7 @@ module.exports = {
       '<div style="margin-bottom:6px;font-weight:600">DeepInfra API Key（<a href="https://deepinfra.com" target="_blank">deepinfra.com</a> 创建，只显示一次）</div>' +
       '<input id="fmb-cfg-key" type="password" placeholder="留空则不修改" style="width:100%;padding:6px;box-sizing:border-box;margin-bottom:4px">' +
       '<div id="fmb-cfg-key-state" style="color:#888;margin-bottom:10px"></div>' +
-      '<div style="margin-bottom:4px">LLM 模型</div><input id="fmb-cfg-model" placeholder="默认 Qwen/Qwen3-30B-A3B" style="width:100%;padding:6px;box-sizing:border-box;margin-bottom:8px">' +
+      '<div style="margin-bottom:4px">LLM 模型</div><input id="fmb-cfg-model" placeholder="默认 Qwen/Qwen2.5-72B-Instruct" style="width:100%;padding:6px;box-sizing:border-box;margin-bottom:8px">' +
       '<div style="margin-bottom:4px">API Base</div><input id="fmb-cfg-apibase" placeholder="默认 https://api.deepinfra.com/v1/openai" style="width:100%;padding:6px;box-sizing:border-box;margin-bottom:8px">' +
       '<div style="margin-bottom:4px">Whisper 引擎路径（留空=PotPlayer 默认）</div><input id="fmb-cfg-wexe" style="width:100%;padding:6px;box-sizing:border-box;margin-bottom:8px">' +
       '<div style="margin-bottom:4px">Whisper 模型父目录（留空=PotPlayer 默认 %APPDATA%\\PotPlayerMini64\\Model）</div><input id="fmb-cfg-wmodel" style="width:100%;padding:6px;box-sizing:border-box;margin-bottom:8px">' +
