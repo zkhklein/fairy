@@ -102,25 +102,27 @@ Studio 页选 N 个媒体文件 → app 写 KV 任务队列（串行消费，_ru
 
 ```
 faster-whisper-xxl.exe "<mediaPath>"
-  --model "<modelDir>"            # 直接指向已下载的 faster-whisper-large-v3-turbo 目录
+  --model large-v3-turbo --model_dir "<modelParentDir>"
+                                    # 已经 spike 锁定：--model 只接受模型名（exe 会拼 <model_dir>\faster-whisper-<名>），
+                                    # 直传目录路径会报 Unknown model not found。modelParentDir = %APPDATA%\PotPlayerMini64\Model
   --output_dir "<workDir>" --output_format srt
   --vad_filter true --standard_asia --print_progress
   --device cuda --compute_type int8_float16
   [--language ja|en]              # auto 时省略
 ```
 
-4. 脚本逐行读 stdout：解析进度百分比与 "Detected language: xx"，节流（≥2s）POST 到 `/api/v1/plugins/com.fmb.subtitle.studio/invoke`（action=`storeProgress`）。
-5. 子进程退出后：exit 0 且 `*.srt` 存在于 workDir → POST 终态到**自己的** invoke 端点（`/api/v1/plugins/com.fmb.subtitle.asr/invoke`，action=`storeResult`，含 srtPath、detectedLanguage）；exit≠0 且日志含 CUDA/cuBLAS 特征 → 以 `--device cpu --compute_type int8` 自动重试一次；仍败 → POST 失败（含日志尾部 20 行摘要）。
+4. 脚本读 stdout（进度/日志全部在 stdout，stderr 为空——已 spike 确认）：按 `\r\n|\r|\n` 切分（tqdm 中间进度用裸 `\r` 刷新），正则 `/(\d+)%\s*\|\s*(\d+)\/(\d+)/` 解析进度行（形如 `100% | 60/60 | 00:00<<00:00 | 68.56 audio seconds/s`），并抓 "Detected language: xx"，节流（≥2s）POST 到 `/api/v1/plugins/com.fmb.subtitle.studio/invoke`（action=`storeProgress`）。
+5. 子进程退出后：**exit code 不可信**（spike 实测模型加载失败也返回 0）——判定成功只看 `<workDir>\<stem>.srt` 是否生成（`<stem>` = 媒体文件名去扩展名，不带原扩展名）。成功 → POST 终态到**自己的** invoke 端点（`/api/v1/plugins/com.fmb.subtitle.asr/invoke`，action=`storeResult`，含 srtPath、detectedLanguage）；失败且日志含 CUDA/cuBLAS 特征 → 以 `--device cpu --compute_type int8` 自动重试一次；仍败 → POST 失败（含日志尾部 20 行摘要）。
 6. 插件侧轮询 KV `asrResult:<taskId>` 直到出现终态（活性等待：有进度心跳就不算停滞；10 分钟无进度判停滞失败；硬上限 4 小时）。
 
 **whisper 路径/模型定位**（KV 可覆盖，默认自动探测）：
 
 - `config:whisperExe` 默认 `%APPDATA%\PotPlayerMini64\Engine\Faster-Whisper-XXL\faster-whisper-xxl.exe`
-- `config:whisperModel` 默认 `%APPDATA%\PotPlayerMini64\Model\faster-whisper-large-v3-turbo`
+- `config:whisperModelDir` 默认 `%APPDATA%\PotPlayerMini64\Model`（**模型父目录**，配合固定 `--model large-v3-turbo` 使用；spike 已锁定此形态）
 - `config:nodePath` 默认 `C:\Program Files\nodejs\node.exe`
 - `%APPDATA%` 由 `__hostEnv` 无此键 —— 用 `__hostEnv.HOME` + `\AppData\Roaming` 推导，或探测默认候选路径（实现时以 spike 验证为准）。
 
-**备注**：`--model` 直传本地目录 vs `--model large-v3-turbo --model_dir <父目录>` 的确切形态，实现第一步用真实小文件 spike 验证后锁定。
+**备注**：`--model` 直传本地目录 vs `--model large-v3-turbo --model_dir <父目录>` 的确切形态——**spike（2026-09-17）已锁定为后者**：前者被 exe 当成模型名拼成 `…\_models\faster-whisper-C:\Users\…` 报 `Unknown model not found`（且 exit code 仍为 0）。
 
 ### 4.2 `com.fmb.subtitle.llmtranslate`（atomic）
 
@@ -279,7 +281,7 @@ entryNode: asr
 | `writeResult:<taskId>` | writer | 写盘脚本终态结果 |
 | `progress:<taskId>` | studio | 最新进度文本（storeProgress 覆盖写） |
 | `config:nodePath` | 三原子各自 | node.exe 路径覆盖 |
-| `config:whisperExe` / `config:whisperModel` | asr | 引擎/模型路径覆盖 |
+| `config:whisperExe` / `config:whisperModelDir` | asr | 引擎路径 / 模型父目录路径覆盖 |
 | `config:apiBase` / `config:model` | llmtranslate | DeepInfra 端点/模型覆盖 |
 | `config:glossary` | llmtranslate | 术语表文本（可选，配置页粘贴） |
 | `config:glossaryPaths` | llmtranslate | 外部知识库文件绝对路径列表（JSON 数组，可选；失效路径跳过+告警不阻断） |
