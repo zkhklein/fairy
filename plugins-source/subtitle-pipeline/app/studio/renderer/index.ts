@@ -6,6 +6,8 @@
  * hostUIApi.callPluginMainAction(action, payload) → sandbox main module.
  * window.fmb.dialogShowOpen → native file picker.
  */
+var pollTimer = null;
+
 module.exports = {
   mount(hostEl, hostApi) {
     var root = document.createElement('div');
@@ -137,15 +139,17 @@ module.exports = {
           var tr = document.createElement('tr');
           var result = t.status === 'done' ? t.finalPath : (t.error || '');
           tr.innerHTML =
-            '<td style="padding:6px;border-bottom:1px solid #f0f0f0" title="' + (t.mediaPath || '').replace(/"/g, '&quot;') + '"></td>' +
+            '<td style="padding:6px;border-bottom:1px solid #f0f0f0"></td>' +
             '<td style="padding:6px;border-bottom:1px solid #f0f0f0">' + ({ auto: '自动', ja: '日语', en: '英语' })[t.language || 'auto'] + '</td>' +
             '<td style="padding:6px;border-bottom:1px solid #f0f0f0">' + (STATUS_TEXT[t.status] || t.status) + '</td>' +
             '<td style="padding:6px;border-bottom:1px solid #f0f0f0"></td>' +
-            '<td style="padding:6px;border-bottom:1px solid #f0f0f0;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + String(result || '').replace(/"/g, '&quot;') + '"></td>' +
+            '<td style="padding:6px;border-bottom:1px solid #f0f0f0;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></td>' +
             '<td style="padding:6px;border-bottom:1px solid #f0f0f0;text-align:right"></td>';
           tr.children[0].textContent = t.fileName || t.mediaPath;
+          tr.children[0].title = t.mediaPath || '';
           tr.children[3].textContent = t.progressText || '';
           tr.children[4].textContent = result || '';
+          tr.children[4].title = String(result || '');
           tr.children[4].style.color = t.status === 'failed' ? '#c00' : 'inherit';
           var ops = tr.children[5];
           if (t.status === 'failed') {
@@ -181,6 +185,13 @@ module.exports = {
 
     hostEl.appendChild(root);
     refreshTasks();
-    setInterval(refreshTasks, 5000);
+    pollTimer = setInterval(refreshTasks, 5000);
+  },
+
+  unmount: function () {
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
   },
 };
