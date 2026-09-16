@@ -1,0 +1,97 @@
+/*__FMB_PARAMS__*/
+(function () {
+  var fs = require('fs'), path = require('path'), http = require('http'), cp = require('child_process');
+  function findHttpMeta(fdd) {
+    var c = [];
+    if (process.env.FMB_HTTP_PORT && process.env.FMB_HTTP_TOKEN) return { port: +process.env.FMB_HTTP_PORT, token: process.env.FMB_HTTP_TOKEN };
+    if (fdd) { c.push(path.join(fdd, '.fmb-http.json')); c.push(path.join(fdd, 'userData', '.fmb-http.json')); }
+    if (process.env.APPDATA) c.push(path.join(process.env.APPDATA, 'fairy-maid-brigade', '.fmb-http.json'));
+    if (process.env.LOCALAPPDATA) c.push(path.join(process.env.LOCALAPPDATA, 'fairy-maid-brigade', '.fmb-http.json'));
+    for (var i = 0; i < c.length; i++) { try { if (fs.existsSync(c[i])) return JSON.parse(fs.readFileSync(c[i], 'utf8')); } catch (_) {} }
+    return null;
+  }
+  function postInvoke(meta, pluginId, action, payload) {
+    return new Promise(function (resolve) {
+      try {
+        var body = JSON.stringify({ action: action, payload: payload });
+        var req = http.request({ hostname: '127.0.0.1', port: meta.port, path: '/api/v1/plugins/' + pluginId + '/invoke', method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body), 'Authorization': 'Bearer ' + meta.token } }, function (res) { var d = ''; res.on('data', function (x) { d += x; }); res.on('end', function () { resolve(d); }); });
+        req.on('error', function () { resolve(null); });
+        req.write(body); req.end();
+      } catch (_) { resolve(null); }
+    });
+  }
+  /* spike 实测：whisper 退出码恒 0 —— 成功判定 = workDir 出现 raw.srt 以外的 *.srt（0 字节 srt 也合法：全静音媒体） */
+  function findProducedSrt() {
+    try {
+      var files = fs.readdirSync(P.workDir).filter(function (f) { return /\.srt$/i.test(f) && f !== 'raw.srt'; });
+      return files.length ? files[0] : null;
+    } catch (_) { return null; }
+  }
+  function runWhisper(device, ct, onLine) {
+    return new Promise(function (resolve) {
+      /* --model 收模型名，--model_dir 收模型父目录（spike 实测：直传目录会被 exe 当模型名拼接） */
+      var args = (P.argsPrefix || []).concat([
+        P.mediaPath, '--model', 'large-v3-turbo', '--model_dir', P.modelDir, '--output_dir', P.workDir, '--output_format', 'srt',
+        '--print_progress', '--vad_filter', 'true', '--standard_asia', '--device', device, '--compute_type', ct,
+      ]);
+      if (P.language && P.language !== 'auto') args.push('--language', P.language);
+      var child = cp.spawn(P.whisperExe, args, { windowsHide: true });
+      var tail = [];
+      function feed(chunk) {
+        /* 进度行走 stdout（stderr 为空），tqdm 以 \r 覆写同行：三种断行符都要切 */
+        String(chunk).split(/\r\n|\r|\n/).forEach(function (line) {
+          if (!line) return;
+          tail.push(line); if (tail.length > 40) tail.shift();
+          onLine(line);
+        });
+      }
+      child.stdout.on('data', feed);
+      child.stderr.on('data', feed);
+      child.on('error', function (e) { resolve({ tail: tail.concat([String(e)]) }); });
+      child.on('close', function () { resolve({ tail: tail }); });
+    });
+  }
+  async function main() {
+    var meta = findHttpMeta(P.fmbDataDir);
+    var detected = '';
+    var lastPost = 0;
+    var self = P.callbackPluginId, studio = P.studioPluginId;
+    var onLine = function (line) {
+      var m = line.match(/Detected language:\s*([A-Za-z]+)/i);
+      if (m) detected = m[1].toLowerCase();
+      var p = line.match(/(\d+(?:\.\d+)?)\s*%/);
+      var now = Date.now();
+      if (p && now - lastPost >= 2000) {
+        lastPost = now;
+        if (meta) {
+          postInvoke(meta, studio, 'storeProgress', { taskId: P.taskId, stage: 'asr', text: '转写中 · ' + Math.round(parseFloat(p[1])) + '%' });
+          postInvoke(meta, self, 'storeProgress', { taskId: P.taskId, ts: now });
+        }
+      }
+    };
+    var startedAt = Date.now();
+    var r1 = await runWhisper('cuda', 'int8_float16', onLine);
+    var srt = findProducedSrt();
+    var retried = false, tail = r1.tail;
+    if (!srt && /cuda|cublas|cudnn|float16/i.test(r1.tail.join('\n'))) {
+      retried = true;
+      if (meta) await postInvoke(meta, studio, 'storeProgress', { taskId: P.taskId, stage: 'asr', text: 'CUDA 失败，回退 CPU 重试…' });
+      var r2 = await runWhisper('cpu', 'int8', onLine);
+      tail = r2.tail;
+      srt = findProducedSrt();
+    }
+    if (!srt) {
+      var errTail = tail.slice(-20).join(' | ');
+      if (meta) { await postInvoke(meta, self, 'storeResult', { taskId: P.taskId, ok: false, error: 'whisper 未产出 srt: ' + errTail }); await postInvoke(meta, studio, 'storeProgress', { taskId: P.taskId, stage: 'error', text: 'whisper 未产出 srt' }); }
+      console.error('asr failed: no srt produced');
+      process.exit(1);
+    }
+    var rawPath = path.join(P.workDir, 'raw.srt');
+    fs.renameSync(path.join(P.workDir, srt), rawPath);
+    var summary = { ok: true, srtPath: rawPath, detectedLanguage: detected || (P.language !== 'auto' ? P.language : ''), durationMs: Date.now() - startedAt, retriedWithCpu: retried };
+    console.log(JSON.stringify(summary));
+    if (meta) await postInvoke(meta, self, 'storeResult', Object.assign({ taskId: P.taskId }, summary));
+    process.exit(0);
+  }
+  main().catch(function (e) { console.error('asr crashed: ' + (e && e.message)); process.exit(1); });
+})();

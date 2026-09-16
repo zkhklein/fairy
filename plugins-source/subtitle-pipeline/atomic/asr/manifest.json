@@ -1,0 +1,10 @@
+{
+  "id": "com.fmb.subtitle.asr",
+  "name": "Whisper ASR",
+  "version": "0.1.0",
+  "type": "atomic",
+  "description": "Wraps faster-whisper-xxl.exe (bundled with PotPlayer) to transcribe audio/video into raw.srt with timeline; parses progress + detected language; success is detected by srt existence (exit code is always 0); CUDA failure auto-falls back to CPU int8 once.",
+  "permissions": ["system:process:start", "system:process:read", "kv:read", "kv:write", "log:write"],
+  "dependencies": {},
+  "main": "main.js"
+}
