@@ -144,7 +144,7 @@ faster-whisper-xxl.exe "<mediaPath>"
 输入：`{ taskId, srtPath, sourceLang, workDir }`（v1 目标语言固定中文）
 输出：`{ ok, translatedSrtPath, lineCount, chunks, usage }`
 
-**翻译脚本**（内嵌 Node 脚本，stdlib `https`/`fs`，经环境变量 `FMB_LLM_API_KEY` 收 key——不写进脚本文件、不上命令行）：
+**翻译脚本**（内嵌 Node 脚本，stdlib `https`/`fs`；API key 由脚本运行时通过 localhost invoke `getApiKey` 向 llmtranslate 插件自取（响应体同步返回），key 不落盘、不上命令行、不进脚本源码）：
 
 1. **SRT 解析**：解析为条目数组 `{ index, start, end, text }`（支持多行文本合并、CRLF/LF、BOM 剔除）。
 2. **分块**：按"≤25 条 且 ≤1500 字符"贪心切块（先到先切）。
