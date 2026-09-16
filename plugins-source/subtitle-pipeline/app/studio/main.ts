@@ -4,6 +4,7 @@
 var WF_ID = 'wf-subtitle-flow';
 var TASKS_KEY = 'tasks';
 var _running = false;
+var _timer = null;
 
 function _dataRoot() {
   var f = typeof __filename === 'string' ? __filename : '';
@@ -79,6 +80,7 @@ async function _tick() {
   var tasks = await _loadTasks();
   var next = tasks.find(function (t) { return t.status === 'queued'; });
   if (!next) return;
+  if (_running) return;
   _running = true;
   try { await _runTask(next); } finally { _running = false; }
 }
@@ -93,9 +95,12 @@ module.exports = {
       if (t.status === 'asr' || t.status === 'translating' || t.status === 'writing') { t.status = 'queued'; t.progressText = '重启后自动恢复排队'; changed = true; }
     });
     if (changed) await _saveTasks(tasks);
-    setInterval(function () { _tick().catch(function (e) { hostApi.logger.warn('studio tick error', { error: e && e.message }); }); }, 2000);
+    _timer = setInterval(function () { _tick().catch(function (e) { hostApi.logger.warn('studio tick error', { error: e && e.message }); }); }, 2000);
   },
-  deactivate() { hostApi.logger.info('subtitle-studio deactivated', {}); },
+  deactivate() {
+    if (_timer) { clearInterval(_timer); _timer = null; }
+    hostApi.logger.info('subtitle-studio deactivated', {});
+  },
 
   /* ---- UI actions ---- */
   async listTasks() { return { ok: true, tasks: await _loadTasks() }; },
