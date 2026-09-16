@@ -158,7 +158,7 @@ faster-whisper-xxl.exe "<mediaPath>"
      4. 译文是字幕：口语化、简洁，单行译文尽量不超过 30 个汉字。
      5. 【上下文】仅帮助理解，不要翻译。
      ```
-   - user：`【术语表】…`（可选，见 §5 `config:glossary`）+ `【上下文】`（前块末 2 条原文，首块省略）+ 编号行 `«i» 原文`。
+   - user：`【术语表】…`（可选，见下方"术语表双通道"）+ `【上下文】`（前块末 2 条原文，首块省略）+ 编号行 `«i» 原文`。
    - payload：`model`（KV 默认 `Qwen/Qwen3-30B-A3B`）、`temperature: 0.3`、`max_tokens: 8192`、`chat_template_kwargs: { enable_thinking: false }`。
 4. **响应解析**：正则逐行抓 `«i» 译文`；**行数不等或编号不连续 → 该块重试**（最多 3 次：第 2 次 temperature 降 0.15 并追加"上次行数不符，必须严格逐行"提醒；HTTP 429/5xx/网络错误 → 指数退避 2/4/8/16s 最多 4 次）。块最终失败 → 整个 action 失败并报出错块号。
 5. **进度**：每块完成 POST 进度到 studio（action=`storeProgress`，`done/total` 块数）。
@@ -166,6 +166,15 @@ faster-whisper-xxl.exe "<mediaPath>"
 7. 完成 POST 终态到自己的 invoke 端点（action=`storeResult`，含 usage 汇总，供 UI 展示 token 消耗）。
 
 **空文本条目**直接透传不占翻译请求。
+
+**术语表双通道**（用户可能移动 SUCCUBUSQ 项目位置，知识库路径必须可配置）：
+
+1. `config:glossary`（KV 文本）：studio 配置页粘贴的术语表原文。
+2. `config:glossaryPaths`（KV，JSON 字符串数组）：外部知识库文件的**绝对路径列表**，翻译时由脚本实时读取拼接。典型用途：指向 SUCCUBUSQ 的知识库（如 `D:\BOAT\SUCCUBUSQ\knowledge\terminology\characters.md`），文件更新即生效，无需重新粘贴。
+3. 容错：某个路径不存在/不可读 → 脚本记录警告并跳过该文件，**不阻断翻译**（SUCCUBUSQ 被移动后只需在配置页改路径）。
+4. 两通道可同时使用，拼接顺序：路径文件在前、粘贴文本在后。
+
+> 注意：插件仅**读取**这些知识文件；翻译链路本身（端点/模型/协议）自包含，不调用 SUCCUBUSQ 的 Python 脚本，对其位置无硬依赖。
 
 ### 4.3 `com.fmb.subtitle.writer`（atomic）
 
@@ -257,7 +266,7 @@ entryNode: asr
 
 - 顶部操作栏：【选择媒体文件】（`window.fmb.dialogShowOpen({ multiSelections: true, openFile: true, filters: [{ name: '媒体文件', extensions: ['mp4','mkv','avi','mov','webm','mp3','m4a','aac','flac','wav','ogg'] }] })`）、语言覆盖下拉（自动检测/日语/英语，作为新任务默认值）
 - 任务表格：文件名、源语言、状态（queued/asr/translating/writing/done/failed）、进度文本（如 `转写中 · 42%`、`翻译中 · 块 7/24`）、最终路径（可复制）、操作（重试/删除）
-- 配置区（折叠）：DeepInfra API Key（secrets.set）、模型名、API Base（默认 `https://api.deepinfra.com/v1/openai`）、whisper 路径/模型路径（留空=自动探测）、术语表 textarea（可选，格式兼容 SUCCUBUSQ characters.md 的 markdown 表格原文粘贴）
+- 配置区（折叠）：DeepInfra API Key（secrets.set）、模型名、API Base（默认 `https://api.deepinfra.com/v1/openai`）、whisper 路径/模型路径（留空=自动探测）、术语表 textarea（可选，兼容 SUCCUBUSQ characters.md 格式直接粘贴）、知识库文件路径 textarea（可选，每行一个绝对路径，如指向 SUCCUBUSQ 的 knowledge 文件；移动项目后改这里即可）
 - 5s 轮询任务表刷新；操作反馈用 antd message（成功/失败明确提示）
 
 ## 5. KV / secrets 键约定
@@ -272,7 +281,8 @@ entryNode: asr
 | `config:nodePath` | 三原子各自 | node.exe 路径覆盖 |
 | `config:whisperExe` / `config:whisperModel` | asr | 引擎/模型路径覆盖 |
 | `config:apiBase` / `config:model` | llmtranslate | DeepInfra 端点/模型覆盖 |
-| `config:glossary` | llmtranslate | 术语表文本（可选） |
+| `config:glossary` | llmtranslate | 术语表文本（可选，配置页粘贴） |
+| `config:glossaryPaths` | llmtranslate | 外部知识库文件绝对路径列表（JSON 数组，可选；失效路径跳过+告警不阻断） |
 | secret key `deepinfra_api_key` | studio 写入、llmtranslate 读 | DeepInfra API Key |
 
 secrets 为全局键空间（`secret-store.ts getSecret(key)` 按 key 直查，不按插件隔离）：studio 写入、llmtranslate 读取即可。key 只经环境变量传给脚本进程，**绝不写进 KV/日志/脚本文件**。
@@ -316,4 +326,4 @@ secrets 为全局键空间（`secret-store.ts getSecret(key)` 按 key 直查，�
 - 定时扫描目录自动处理（scheduleTemplate）
 - 说话人分离（whisper `--diarize`）、人声分离（`--ff_vocal_extract`）
 - 翻译并发块、块级断点续翻
-- 术语表 UI 管理（v1 为纯文本粘贴）
+- 术语表结构化管理（表格编辑器；v1 为粘贴文本 + 外部文件路径引用）
