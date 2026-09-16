@@ -1,0 +1,10 @@
+{
+  "id": "com.fmb.subtitle.llmtranslate",
+  "name": "LLM Subtitle Translator",
+  "version": "0.1.0",
+  "type": "atomic",
+  "description": "Translates SRT entries to Chinese via DeepInfra (Qwen3-30B-A3B) with chunked numbered-line contract, backoff retries, optional glossary (paste + external file paths). API key is fetched at runtime via localhost invoke, never persisted by the runner.",
+  "permissions": ["system:process:start", "system:process:read", "kv:read", "kv:write", "secrets:read", "log:write"],
+  "dependencies": {},
+  "main": "main.js"
+}

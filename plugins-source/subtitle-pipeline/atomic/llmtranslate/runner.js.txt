@@ -1,0 +1,172 @@
+/*__FMB_PARAMS__*/
+(function () {
+  var fs = require('fs'), path = require('path'), http = require('http'), https = require('https');
+  function findHttpMeta(fdd) {
+    var c = [];
+    if (process.env.FMB_HTTP_PORT && process.env.FMB_HTTP_TOKEN) return { port: +process.env.FMB_HTTP_PORT, token: process.env.FMB_HTTP_TOKEN };
+    if (fdd) { c.push(path.join(fdd, '.fmb-http.json')); c.push(path.join(fdd, 'userData', '.fmb-http.json')); }
+    if (process.env.APPDATA) c.push(path.join(process.env.APPDATA, 'fairy-maid-brigade', '.fmb-http.json'));
+    if (process.env.LOCALAPPDATA) c.push(path.join(process.env.LOCALAPPDATA, 'fairy-maid-brigade', '.fmb-http.json'));
+    for (var i = 0; i < c.length; i++) { try { if (fs.existsSync(c[i])) return JSON.parse(fs.readFileSync(c[i], 'utf8')); } catch (_) {} }
+    return null;
+  }
+  function postRaw(meta, pluginId, action, payload) {
+    return new Promise(function (resolve) {
+      try {
+        var body = JSON.stringify({ action: action, payload: payload });
+        var req = http.request({ hostname: '127.0.0.1', port: meta.port, path: '/api/v1/plugins/' + pluginId + '/invoke', method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body), 'Authorization': 'Bearer ' + meta.token } }, function (res) { var d = ''; res.on('data', function (x) { d += x; }); res.on('end', function () { resolve(d); }); });
+        req.on('error', function () { resolve(null); });
+        req.write(body); req.end();
+      } catch (_) { resolve(null); }
+    });
+  }
+  function postInvoke(meta, pluginId, action, payload) { return postRaw(meta, pluginId, action, payload).then(function () {}); }
+  function invokeGet(meta, pluginId, action, payload) {
+    return postRaw(meta, pluginId, action, payload).then(function (d) {
+      try { var j = JSON.parse(d); return j && j.result; } catch (_) { return null; }
+    });
+  }
+  function parseSrt(text) {
+    var t = String(text).replace(/^﻿/, '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    var blocks = t.split(/\n\n+/), out = [];
+    for (var i = 0; i < blocks.length; i++) {
+      var lines = blocks[i].split('\n').filter(function (l) { return l.trim() !== ''; });
+      if (!lines.length) continue;
+      var off = /^\d+$/.test(lines[0].trim()) ? 1 : 0;
+      if (off >= lines.length) continue;
+      var m = lines[off].match(/(\d{2}:\d{2}:\d{2}[,.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,.]\d{3})/);
+      if (!m) continue;
+      out.push({ start: m[1].replace('.', ','), end: m[2].replace('.', ','), text: lines.slice(off + 1).join('\n') });
+    }
+    return out;
+  }
+  function formatSrt(entries) {
+    var o = [];
+    for (var i = 0; i < entries.length; i++) o.push(String(i + 1), entries[i].start + ' --> ' + entries[i].end, entries[i].text, '');
+    return o.join('\r\n') + '\r\n';
+  }
+  function chunkEntries(entries, maxN, maxChars) {
+    var chunks = [], cur = [], cc = 0;
+    for (var i = 0; i < entries.length; i++) {
+      var len = entries[i].text.length;
+      if (cur.length && (cur.length >= maxN || cc + len > maxChars)) { chunks.push(cur); cur = []; cc = 0; }
+      cur.push(entries[i]); cc += len;
+    }
+    if (cur.length) chunks.push(cur);
+    return chunks;
+  }
+  function parseNumbered(text) {
+    var map = {};
+    String(text).split(/\r?\n/).forEach(function (line) {
+      var m = line.match(/^\s*«\s*(\d{1,4})\s*»\s*(.*)$/);
+      if (m && m[2].trim()) map[+m[1]] = m[2].trim();
+    });
+    return map;
+  }
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+  function fatal(msg) { var e = new Error(msg); e.fatal = true; return e; }
+  function chatCompletion(cfg, messages, temperature) {
+    return new Promise(function (resolve, reject) {
+      /* apiBase 允许裸主机（缺省补 /v1/openai）或已带路径的 OpenAI 兼容 base */
+      var ub = new URL(cfg.apiBase);
+      var bp = ub.pathname.replace(/\/+$/, '');
+      var u = new URL((bp || '/v1/openai') + '/chat/completions', ub);
+      var mod = u.protocol === 'http:' ? http : https;
+      var body = JSON.stringify({ model: cfg.model, messages: messages, temperature: temperature, max_tokens: 8192, chat_template_kwargs: { enable_thinking: false } });
+      var req = mod.request({ hostname: u.hostname, port: u.port || (u.protocol === 'http:' ? 80 : 443), path: u.pathname, method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + cfg.apiKey, 'Content-Length': Buffer.byteLength(body) }, timeout: 300000 }, function (res) {
+        var d = ''; res.on('data', function (c) { d += c; });
+        res.on('end', function () {
+          if (res.statusCode === 429 || res.statusCode >= 500) return reject(new Error('HTTP ' + res.statusCode + ': ' + d.slice(0, 200)));
+          if (res.statusCode !== 200) return reject(fatal('HTTP ' + res.statusCode + ': ' + d.slice(0, 300)));
+          try { var j = JSON.parse(d); resolve({ content: j.choices[0].message.content, usage: j.usage || {} }); }
+          catch (e) { reject(new Error('bad json: ' + d.slice(0, 120))); }
+        });
+      });
+      req.on('timeout', function () { req.destroy(new Error('request timeout')); });
+      req.on('error', reject);
+      req.write(body); req.end();
+    });
+  }
+  async function callWithRetry(cfg, messages, temperature) {
+    var delays = [2000, 4000, 8000, 16000];
+    for (var i = 0; ; i++) {
+      try { return await chatCompletion(cfg, messages, temperature); }
+      catch (e) { if (e.fatal || i >= delays.length) throw e; await sleep(delays[i]); }
+    }
+  }
+  function buildSystem(src) {
+    return '你是专业字幕翻译引擎。规则：\n' +
+      '1. 把每行从' + src + '翻译为中文，只输出译文行，不输出解释。\n' +
+      '2. 输入每行格式 «i» 原文；输出必须严格逐行对应 «i» 译文，行数一致，不得合并、拆分、遗漏。\n' +
+      '3. 忠实原文的语气、风格和尺度，不自行净化或改写。\n' +
+      '4. 译文是字幕：口语化、简洁，单行译文尽量不超过 30 个汉字。\n' +
+      '5.【上下文】仅帮助理解，不要翻译。';
+  }
+  function loadGlossary() {
+    var parts = [];
+    (P.glossaryPaths || []).forEach(function (p) {
+      try { parts.push('### ' + path.basename(p) + '\n' + fs.readFileSync(p, 'utf8').replace(/^﻿/, '').trim()); }
+      catch (e) { console.error('glossary path skipped: ' + p + ' (' + (e && e.message) + ')'); }
+    });
+    if (P.glossary && String(P.glossary).trim()) parts.push(String(P.glossary).trim());
+    return parts.join('\n\n');
+  }
+  async function main() {
+    var meta = findHttpMeta(P.fmbDataDir);
+    if (!meta) throw fatal('找不到 FMB HTTP 元信息（.fmb-http.json）');
+    var entries = parseSrt(fs.readFileSync(P.srtPath, 'utf8'));
+    /* 零条目 srt 合法（全静音媒体）：写空 translated.srt 并直接报告成功，不取 key、不调 LLM */
+    if (!entries.length) {
+      var emptyPath = path.join(P.workDir, 'translated.srt');
+      fs.writeFileSync(emptyPath, '', 'utf8');
+      console.log(JSON.stringify({ ok: true, translatedSrtPath: emptyPath, lineCount: 0, chunks: 0, tokens: 0 }));
+      await postInvoke(meta, P.callbackPluginId, 'storeResult', { taskId: P.taskId, ok: true, translatedSrtPath: emptyPath, lineCount: 0, chunks: 0, usage: { total_tokens: 0 } });
+      return;
+    }
+    var keyRes = await invokeGet(meta, P.callbackPluginId, 'getApiKey', {});
+    if (!keyRes || !keyRes.key) throw fatal('未配置 DeepInfra API Key（在 Studio 配置页填写）');
+    var cfg = { apiKey: keyRes.key, apiBase: P.apiBase || 'https://api.deepinfra.com/v1/openai', model: P.model || 'Qwen/Qwen3-30B-A3B' };
+    var glossary = loadGlossary();
+    var src = ({ ja: '日语', en: '英语' })[P.sourceLang] || '外语';
+    var chunks = chunkEntries(entries, 25, 1500);
+    var totalTokens = 0;
+    for (var ci = 0; ci < chunks.length; ci++) {
+      var chunk = chunks[ci], offset = entries.indexOf(chunk[0]);
+      var numbered = chunk.map(function (e, i) { return '«' + (offset + i + 1) + '» ' + e.text.replace(/\s+/g, ' '); }).join('\n');
+      var userParts = [];
+      if (glossary) userParts.push('【术语表/参考资料】\n' + glossary);
+      if (ci > 0) {
+        var ctxLines = entries.slice(Math.max(0, offset - 2), offset).map(function (e) { return e.text.replace(/\s+/g, ' '); });
+        if (ctxLines.length) userParts.push('【上下文】\n' + ctxLines.join('\n'));
+      }
+      userParts.push('【原文】\n' + numbered);
+      var messages = [{ role: 'system', content: buildSystem(src) }, { role: 'user', content: userParts.join('\n\n') }];
+      var translated = null, lastErr = null;
+      for (var attempt = 0; attempt < 3 && !translated; attempt++) {
+        try {
+          var temp = attempt === 0 ? 0.3 : 0.15;
+          var msgs = attempt === 0 ? messages : messages.concat([{ role: 'user', content: '上次输出行数不符。必须严格逐行输出 «i» 译文，共 ' + chunk.length + ' 行。' }]);
+          var r = await callWithRetry(cfg, msgs, temp);
+          totalTokens += (r.usage && r.usage.total_tokens) || 0;
+          var map = parseNumbered(r.content);
+          var lines = [], ok = true;
+          for (var k = 0; k < chunk.length; k++) { var v = map[offset + k + 1]; if (!v) { ok = false; break; } lines.push(v); }
+          if (ok) translated = lines; else lastErr = new Error('行数不符: expect ' + chunk.length + ' got ' + Object.keys(map).length);
+        } catch (e) { lastErr = e; }
+      }
+      if (!translated) throw fatal('块 ' + (ci + 1) + '/' + chunks.length + ' 翻译失败: ' + (lastErr && lastErr.message));
+      for (var k2 = 0; k2 < chunk.length; k2++) chunk[k2].text = translated[k2];
+      await postInvoke(meta, P.studioPluginId, 'storeProgress', { taskId: P.taskId, stage: 'translating', text: '翻译中 · 块 ' + (ci + 1) + '/' + chunks.length });
+      await postInvoke(meta, P.callbackPluginId, 'storeProgress', { taskId: P.taskId, ts: Date.now() });
+    }
+    var outPath = path.join(P.workDir, 'translated.srt');
+    fs.writeFileSync(outPath, formatSrt(entries), 'utf8');
+    console.log(JSON.stringify({ ok: true, translatedSrtPath: outPath, lineCount: entries.length, chunks: chunks.length, tokens: totalTokens }));
+    await postInvoke(meta, P.callbackPluginId, 'storeResult', { taskId: P.taskId, ok: true, translatedSrtPath: outPath, lineCount: entries.length, chunks: chunks.length, usage: { total_tokens: totalTokens } });
+  }
+  main().then(function () { process.exit(0); }).catch(async function (e) {
+    console.error('llm failed: ' + (e && e.message));
+    try { var meta = findHttpMeta(P.fmbDataDir); if (meta) { await postInvoke(meta, P.callbackPluginId, 'storeResult', { taskId: P.taskId, ok: false, error: String(e && e.message || e) }); await postInvoke(meta, P.studioPluginId, 'storeProgress', { taskId: P.taskId, stage: 'error', text: String(e && e.message || e) }); } } catch (_) {}
+    setTimeout(function () { process.exit(1); }, 1000);
+  });
+})();
