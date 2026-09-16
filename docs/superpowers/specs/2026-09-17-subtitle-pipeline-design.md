@@ -294,7 +294,7 @@ secrets 为全局键空间（`secret-store.ts getSecret(key)` 按 key 直查，�
 | 故障 | 检测 | 行为 |
 |---|---|---|
 | whisper exe / 模型缺失 | spawn ENOENT / 输出文件不存在 | 任务 failed，错误提示含期望路径与配置入口 |
-| CUDA 初始化失败 | 子进程非 0 + 日志含 CUDA 特征 | 自动 `--device cpu --compute_type int8` 重试一次 |
+| CUDA 初始化失败 | whisper 结束但未产出 srt + 日志含 CUDA/cuBLAS 特征 | 自动 `--device cpu --compute_type int8` 重试一次 |
 | whisper 停滞 | 10 分钟无进度心跳 | 任务 failed（硬上限 4h） |
 | DeepInfra 429/5xx/断网 | HTTP 状态/异常 | 块级指数退避 ×4 → 仍败则任务 failed（可整任务重试） |
 | 翻译行数契约违反 | 响应行数≠块条目数 | 块级重试 ×3（降温+严格提醒）→ 仍败任务 failed |
