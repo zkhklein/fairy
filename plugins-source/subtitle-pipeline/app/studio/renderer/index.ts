@@ -174,8 +174,10 @@ module.exports = {
         title: '选择视频/音频文件', multiSelections: true, openFile: true, openDirectory: false,
         filters: [{ name: '媒体文件', extensions: ['mp4', 'mkv', 'avi', 'mov', 'webm', 'mp3', 'm4a', 'aac', 'flac', 'wav', 'ogg'] }],
       }).then(function (r) {
-        var paths = (r && (r.paths || (r.path ? [r.path] : []))) || [];
-        if (!paths.length) return;
+        /* dialogShowOpen 返回 { canceled, filePaths }（MainDialogShowOpenResult 契约） */
+        var paths = (r && Array.isArray(r.filePaths)) ? r.filePaths : [];
+        if (r && r.canceled) return;
+        if (!paths.length) { say('未选择任何文件', true); return; }
         hostApi.callPluginMainAction('createTasks', { paths: paths, language: langSel.value }).then(function (res) {
           say('已添加 ' + (res && res.added != null ? res.added : paths.length) + ' 个任务');
           refreshTasks();
