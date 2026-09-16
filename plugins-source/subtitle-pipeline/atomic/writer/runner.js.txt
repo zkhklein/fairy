@@ -1,0 +1,64 @@
+/*__FMB_PARAMS__*/
+(function () {
+  var fs = require('fs'), path = require('path'), http = require('http');
+  function findHttpMeta(fdd) {
+    var c = [];
+    if (process.env.FMB_HTTP_PORT && process.env.FMB_HTTP_TOKEN) return { port: +process.env.FMB_HTTP_PORT, token: process.env.FMB_HTTP_TOKEN };
+    if (fdd) { c.push(path.join(fdd, '.fmb-http.json')); c.push(path.join(fdd, 'userData', '.fmb-http.json')); }
+    if (process.env.APPDATA) c.push(path.join(process.env.APPDATA, 'fairy-maid-brigade', '.fmb-http.json'));
+    if (process.env.LOCALAPPDATA) c.push(path.join(process.env.LOCALAPPDATA, 'fairy-maid-brigade', '.fmb-http.json'));
+    for (var i = 0; i < c.length; i++) { try { if (fs.existsSync(c[i])) return JSON.parse(fs.readFileSync(c[i], 'utf8')); } catch (_) {} }
+    return null;
+  }
+  function postInvoke(meta, pluginId, action, payload) {
+    return new Promise(function (resolve) {
+      try {
+        var body = JSON.stringify({ action: action, payload: payload });
+        var req = http.request({ hostname: '127.0.0.1', port: meta.port, path: '/api/v1/plugins/' + pluginId + '/invoke', method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body), 'Authorization': 'Bearer ' + meta.token } }, function (res) { var d = ''; res.on('data', function (c2) { d += c2; }); res.on('end', function () { resolve(d); }); });
+        req.on('error', function () { resolve(null); });
+        req.write(body); req.end();
+      } catch (_) { resolve(null); }
+    });
+  }
+  function parseSrt(text) {
+    var t = String(text).replace(/^﻿/, '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    var blocks = t.split(/\n\n+/), out = [];
+    for (var i = 0; i < blocks.length; i++) {
+      var lines = blocks[i].split('\n').filter(function (l) { return l.trim() !== ''; });
+      if (!lines.length) continue;
+      var off = /^\d+$/.test(lines[0].trim()) ? 1 : 0;
+      if (off >= lines.length) continue;
+      var m = lines[off].match(/(\d{2}:\d{2}:\d{2}[,.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,.]\d{3})/);
+      if (!m) continue;
+      out.push({ start: m[1].replace('.', ','), end: m[2].replace('.', ','), text: lines.slice(off + 1).join('\n') });
+    }
+    return out;
+  }
+  function formatSrt(entries) {
+    var o = [];
+    for (var i = 0; i < entries.length; i++) o.push(String(i + 1), entries[i].start + ' --> ' + entries[i].end, entries[i].text.replace(/\n/g, '\r\n'), '');
+    return o.join('\r\n') + '\r\n';
+  }
+  function done(obj) {
+    var meta = findHttpMeta(P.fmbDataDir);
+    var finish = function () { process.exit(obj.ok ? 0 : 1); };
+    if (meta && P.callbackPluginId) postInvoke(meta, P.callbackPluginId, 'storeResult', Object.assign({ taskId: P.taskId }, obj)).then(finish); else finish();
+    setTimeout(finish, 5000);
+  }
+  try {
+    var entries = parseSrt(fs.readFileSync(P.translatedSrtPath, 'utf8'));
+    /* 空 srt 合法（全静音媒体）：仍写出空 .zh.srt 并报告 empty:true；非空条目仍校验 text 非空 */
+    for (var i = 0; i < entries.length; i++) if (!entries[i].text.trim()) throw new Error('第 ' + (i + 1) + ' 条译文为空');
+    var stem = path.basename(P.mediaPath).replace(/\.[^.]+$/, '');
+    var finalPath = path.join(path.dirname(P.mediaPath), stem + '.zh.srt');
+    fs.writeFileSync(finalPath, entries.length ? formatSrt(entries) : '', 'utf8');
+    try { fs.rmSync(P.workDir, { recursive: true, force: true }); } catch (_) {}
+    var result = { ok: true, finalPath: finalPath, entries: entries.length };
+    if (!entries.length) result.empty = true;
+    console.log(JSON.stringify(result));
+    done(result);
+  } catch (e) {
+    console.error('writer failed: ' + (e && e.message));
+    done({ ok: false, error: String(e && e.message || e) });
+  }
+})();
