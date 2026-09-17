@@ -1,6 +1,7 @@
 /* global hostApi, __hostEnv */
 // @ts-nocheck
 import runnerSrc from './runner.js.txt';
+import srtSrc from '../../shared/srt.js.txt';
 
 var DEFAULT_NODE = 'C:\\Program Files\\nodejs\\node.exe';
 
@@ -10,23 +11,6 @@ function _dataRoot() {
   var f = typeof __filename === 'string' ? __filename : '';
   for (var i = 0; i < 3 && f; i++) { var b = f.lastIndexOf('\\'), s = f.lastIndexOf('/'); var x = Math.max(b, s); if (x < 0) break; f = f.substring(0, x); }
   return f;
-}
-function _psPath() { var e = _env(); return (e['SystemRoot'] || 'C:\\Windows') + '\\System32\\WindowsPowerShell\\v1.0\\powershell.exe'; }
-
-/* 唯一名探针判文件存在（照 sevenzip，防串扰） */
-async function _fileExists(filePath) {
-  var probe = 'fmbp' + Math.random().toString(36).slice(2, 10) + '.exe';
-  var checker = "if (Test-Path '" + filePath + "') { Copy-Item \"$env:SystemRoot\\System32\\PING.EXE\" (Join-Path $env:TEMP '" + probe + "') -Force; Start-Process (Join-Path $env:TEMP '" + probe + "') -ArgumentList '-n','6','127.0.0.1' -WindowStyle Hidden; }";
-  try {
-    var enc = Buffer.from(checker, 'utf16le').toString('base64');
-    await hostApi.processes.start({ executablePath: _psPath(), args: ['-NoProfile', '-NonInteractive', '-EncodedCommand', enc], detached: false, timeoutMs: 8000 });
-  } catch (_) { return false; }
-  for (var i = 0; i < 16; i++) {
-    await new Promise(function (r) { setTimeout(r, 500); });
-    var q = await hostApi.processes.query({ processNames: [probe] });
-    if (q[probe]) return true;
-  }
-  return false;
 }
 
 async function _whisperExe() {
@@ -89,29 +73,19 @@ module.exports = {
     if (!payload.mediaPath) throw new Error('transcribe: mediaPath required');
     if (!payload.workDir) throw new Error('transcribe: workDir required');
     var language = payload.language || 'auto';
-    var rawPath = payload.workDir + '\\raw.srt';
-
-    if (await _fileExists(rawPath)) {
-      /* 复用已完成转写：语言从上次终态结果恢复（auto 模式下检测值只在首跑 KV 里） */
-      var lang = language !== 'auto' ? language : '';
-      if (!lang) {
-        try {
-          var prev = await hostApi.kv.get('asrResult:' + taskId);
-          if (prev) { var pr = JSON.parse(prev); if (pr && pr.detectedLanguage) lang = pr.detectedLanguage; }
-        } catch (_) {}
-      }
-      hostApi.logger.info('asr: raw.srt exists, reuse', { taskId: taskId, lang: lang });
-      return { ok: true, srtPath: rawPath, detectedLanguage: lang, durationMs: 0, reused: true };
-    }
+    var previousLanguage = '';
+    try { var previous = JSON.parse(await hostApi.kv.get('asrResult:' + taskId) || '{}'); previousLanguage = previous.detectedLanguage || ''; } catch (_) {}
 
     await hostApi.kv.delete('asrResult:' + taskId);
     await hostApi.kv.delete('asrProgress:' + taskId);
 
-    var script = runnerSrc.replace('/*__FMB_PARAMS__*/', 'var P = ' + JSON.stringify({
+    var params = {
       taskId: taskId, mediaPath: payload.mediaPath, language: language, workDir: payload.workDir,
       whisperExe: await _whisperExe(), modelDir: await _modelDir(),
       fmbDataDir: _dataRoot(), callbackPluginId: 'com.fmb.subtitle.asr', studioPluginId: 'com.fmb.subtitle.studio',
-    }) + ';');
+      previousLanguage: previousLanguage,
+    };
+    var script = runnerSrc.replace('/*__FMB_SRT__*/', function () { return srtSrc; }).replace('/*__FMB_PARAMS__*/', function () { return 'var P = ' + JSON.stringify(params) + ';'; });
 
     await hostApi.processes.start({ executablePath: await _nodePath(), args: ['-e', script], detached: true, timeoutMs: 10000 });
 
@@ -123,7 +97,7 @@ module.exports = {
       if (raw) {
         var r = JSON.parse(raw);
         if (!r.ok) throw new Error('asr: ' + (r.error || 'unknown'));
-        return { ok: true, srtPath: r.srtPath, detectedLanguage: r.detectedLanguage || (language !== 'auto' ? language : ''), durationMs: r.durationMs };
+        return { ok: true, srtPath: r.srtPath, detectedLanguage: r.detectedLanguage || (language !== 'auto' ? language : ''), durationMs: r.durationMs, timelineWarnings: r.timelineWarnings || [] };
       }
       var beat = await hostApi.kv.get('asrProgress:' + taskId);
       if (beat) lastBeat = Math.max(lastBeat, parseInt(beat, 10) || lastBeat);

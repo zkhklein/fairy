@@ -1,6 +1,7 @@
 /*__FMB_PARAMS__*/
 (function () {
   var fs = require('fs'), path = require('path'), http = require('http');
+  /*__FMB_SRT__*/
   function findHttpMeta(fdd) {
     var c = [];
     if (process.env.FMB_HTTP_PORT && process.env.FMB_HTTP_TOKEN) return { port: +process.env.FMB_HTTP_PORT, token: process.env.FMB_HTTP_TOKEN };
@@ -20,25 +21,6 @@
       } catch (_) { resolve(null); }
     });
   }
-  function parseSrt(text) {
-    var t = String(text).replace(/^﻿/, '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-    var blocks = t.split(/\n\n+/), out = [];
-    for (var i = 0; i < blocks.length; i++) {
-      var lines = blocks[i].split('\n').filter(function (l) { return l.trim() !== ''; });
-      if (!lines.length) continue;
-      var off = /^\d+$/.test(lines[0].trim()) ? 1 : 0;
-      if (off >= lines.length) continue;
-      var m = lines[off].match(/(\d{2}:\d{2}:\d{2}[,.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,.]\d{3})/);
-      if (!m) continue;
-      out.push({ start: m[1].replace('.', ','), end: m[2].replace('.', ','), text: lines.slice(off + 1).join('\n') });
-    }
-    return out;
-  }
-  function formatSrt(entries) {
-    var o = [];
-    for (var i = 0; i < entries.length; i++) o.push(String(i + 1), entries[i].start + ' --> ' + entries[i].end, entries[i].text.replace(/\n/g, '\r\n'), '');
-    return o.join('\r\n') + '\r\n';
-  }
   function done(obj) {
     var meta = findHttpMeta(P.fmbDataDir);
     var finish = function () { process.exit(obj.ok ? 0 : 1); };
@@ -47,6 +29,9 @@
   }
   try {
     var entries = parseSrt(fs.readFileSync(P.translatedSrtPath, 'utf8'));
+    if (!P.rawSrtPath) throw new Error('writer: 原文 SRT 路径缺失，无法核对编号和时间轴');
+    var rawText = fs.readFileSync(P.rawSrtPath, 'utf8');
+    assertAligned(parseSrt(rawText), entries);
     /* 空 srt 合法（全静音媒体）：仍写出空 .zh.srt 并报告 empty:true；非空条目仍校验 text 非空 */
     for (var i = 0; i < entries.length; i++) if (!entries[i].text.trim()) throw new Error('第 ' + (i + 1) + ' 条译文为空');
     var stem = path.basename(P.mediaPath).replace(/\.[^.]+$/, '');
@@ -57,7 +42,8 @@
     if (!entries.length) result.empty = true;
     /* 原语言字幕一并落盘：raw.srt → <stem>.<lang>.srt（lang 缺省用 orig）。必须在删 workDir 之前复制 */
     if (P.rawSrtPath && fs.existsSync(P.rawSrtPath)) {
-      var lang = (P.sourceLang && P.sourceLang !== 'auto') ? P.sourceLang : 'orig';
+      var lang = /^[a-z]{2,3}$/.test(P.sourceLang || '') ? P.sourceLang : 'orig';
+      if (lang === 'zh') lang = 'orig';
       var origPath = path.join(mediaDir, stem + '.' + lang + '.srt');
       try {
         var rawText = fs.readFileSync(P.rawSrtPath, 'utf8');

@@ -1,6 +1,7 @@
 /* global hostApi, __hostEnv */
 // @ts-nocheck
 import runnerSrc from './runner.js.txt';
+import srtSrc from '../../shared/srt.js.txt';
 
 var DEFAULT_NODE = 'C:\\Program Files\\nodejs\\node.exe';
 
@@ -39,11 +40,12 @@ module.exports = {
     if (!payload.workDir) throw new Error('emit: workDir required');
     await hostApi.kv.delete('writeResult:' + taskId);
 
-    var script = runnerSrc.replace('/*__FMB_PARAMS__*/', 'var P = ' + JSON.stringify({
+    var params = {
       taskId: taskId, mediaPath: payload.mediaPath, translatedSrtPath: payload.translatedSrtPath,
       rawSrtPath: payload.rawSrtPath || '', sourceLang: payload.sourceLang || '',
       workDir: payload.workDir, fmbDataDir: _dataRoot(), callbackPluginId: 'com.fmb.subtitle.writer',
-    }) + ';');
+    };
+    var script = runnerSrc.replace('/*__FMB_SRT__*/', function () { return srtSrc; }).replace('/*__FMB_PARAMS__*/', function () { return 'var P = ' + JSON.stringify(params) + ';'; });
 
     await hostApi.processes.start({ executablePath: await _nodePath(), args: ['-e', script], detached: true, timeoutMs: 10000 });
 

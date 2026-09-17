@@ -1,6 +1,44 @@
 /*__FMB_PARAMS__*/
 (function () {
-  var fs = require('fs'), path = require('path'), http = require('http'), https = require('https');
+  var fs = require('fs'), path = require('path'), http = require('http'), https = require('https'), crypto = require('crypto');
+  /*__FMB_SRT__*/
+  var secrets = [], reviewDir = '', report = null;
+  function redact(value) {
+    if (typeof value === 'string') {
+      secrets.forEach(function (secret) {
+        if (!secret) return;
+        value = value.split(secret).join('[REDACTED]');
+        value = value.split(JSON.stringify(secret).slice(1, -1)).join('[REDACTED]');
+      });
+      return value;
+    }
+    if (Array.isArray(value)) return value.map(redact);
+    if (value && typeof value === 'object') {
+      var safe = {};
+      Object.keys(value).forEach(function (key) { safe[key] = redact(value[key]); });
+      return safe;
+    }
+    return value;
+  }
+  function diagnostic(event, data) {
+    if (P.retainDiagnostics && reviewDir) {
+      try { fs.appendFileSync(path.join(reviewDir, 'diagnostics.jsonl'), JSON.stringify(redact({ time: new Date().toISOString(), event: event, data: data })) + '\n', 'utf8'); }
+      catch (_) { throw fatal('诊断文件写入失败'); }
+    }
+  }
+  function saveReport() {
+    if (!report || !reviewDir) return '';
+    var safe = redact(report);
+    fs.writeFileSync(path.join(reviewDir, 'review.json'), JSON.stringify(safe, null, 2), 'utf8');
+    function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]; }); }
+    var rows = safe.entries.map(function (e) { return '<tr><td>' + e.id + '<br>' + esc(e.start) + '<br>' + esc(e.end) + '</td><td>' + esc(e.source) + '</td><td>' + esc(e.translation) + '</td><td>' + esc(e.verdict || '未做模型复核') + '<br>' + esc(e.reason) + '</td></tr>'; }).join('');
+    var html = '<!doctype html><html lang="zh"><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src \'none\'; style-src \'unsafe-inline\'"><title>字幕对齐复核</title><style>body{font:16px system-ui;margin:24px}table{border-collapse:collapse;width:100%}td,th{border:1px solid #bbb;padding:10px;vertical-align:top;white-space:pre-wrap}tr:nth-child(even){background:#f4f4f4}</style><h1>字幕对齐复核</h1><p>请逐条对照相邻原文和译文，并结合原音检查串位、省略和听写错误。编号/时间轴一致及模型复核均不能保证语义准确；参考资料不是原音真值。</p><p>状态：' + esc(safe.status) + ' ' + esc(safe.error) + '</p><p>本次请求模型：' + esc(safe.config.model) + '；源语言：' + esc(safe.config.sourceLang) + '；模型复核：' + esc(safe.config.semanticReview) + '</p><table><thead><tr><th>ID / 时间轴</th><th>原文</th><th>译文</th><th>模型复核</th></tr></thead><tbody>' + rows + '</tbody></table></html>';
+    if (safe.timelineWarnings.length) {
+      var notice = '<h2>时间轴质量警告：零时长</h2><p>以下条目完整保留，未删除或调整时间；翻译与结构校验通过不代表时间轴质量合格。请依据原音核查。</p><ul>' + safe.timelineWarnings.map(function (w) { return '<li>ID ' + w.id + '：' + esc(w.start) + ' → ' + esc(w.end) + '</li>'; }).join('') + '</ul>';
+      html = html.replace('<table>', notice + '<table>');
+    }
+    var file = path.join(reviewDir, 'review.html'); fs.writeFileSync(file, html, 'utf8'); return file;
+  }
   function findHttpMeta(fdd) {
     var c = [];
     if (process.env.FMB_HTTP_PORT && process.env.FMB_HTTP_TOKEN) return { port: +process.env.FMB_HTTP_PORT, token: process.env.FMB_HTTP_TOKEN };
@@ -26,25 +64,6 @@
       try { var j = JSON.parse(d); return j && j.result; } catch (_) { return null; }
     });
   }
-  function parseSrt(text) {
-    var t = String(text).replace(/^﻿/, '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-    var blocks = t.split(/\n\n+/), out = [];
-    for (var i = 0; i < blocks.length; i++) {
-      var lines = blocks[i].split('\n').filter(function (l) { return l.trim() !== ''; });
-      if (!lines.length) continue;
-      var off = /^\d+$/.test(lines[0].trim()) ? 1 : 0;
-      if (off >= lines.length) continue;
-      var m = lines[off].match(/(\d{2}:\d{2}:\d{2}[,.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,.]\d{3})/);
-      if (!m) continue;
-      out.push({ start: m[1].replace('.', ','), end: m[2].replace('.', ','), text: lines.slice(off + 1).join('\n') });
-    }
-    return out;
-  }
-  function formatSrt(entries) {
-    var o = [];
-    for (var i = 0; i < entries.length; i++) o.push(String(i + 1), entries[i].start + ' --> ' + entries[i].end, entries[i].text, '');
-    return o.join('\r\n') + '\r\n';
-  }
   function chunkEntries(entries, maxN, maxChars) {
     var chunks = [], cur = [], cc = 0;
     for (var i = 0; i < entries.length; i++) {
@@ -55,13 +74,31 @@
     if (cur.length) chunks.push(cur);
     return chunks;
   }
-  function parseNumbered(text) {
-    var map = {};
-    String(text).split(/\r?\n/).forEach(function (line) {
-      var m = line.match(/^\s*«\s*(\d{1,4})\s*»\s*(.*)$/);
-      if (m && m[2].trim()) map[+m[1]] = m[2].trim();
+  function parseTranslations(content, cues) {
+    /* JSON 契约（同步 SUCCUBUSQ subtitles.py validate_translations）：source 逐字回显校验抓内容串位 */
+    var value;
+    try { value = JSON.parse(content); } catch (_) { throw new Error('输出不是有效 JSON 对象'); }
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('输出必须是 JSON 对象');
+    var keys = Object.keys(value);
+    if (keys.length !== 1 || keys[0] !== 'translations' || !Array.isArray(value.translations)) throw new Error('输出必须只含 translations 数组');
+    var expected = {};
+    cues.forEach(function (c) { expected[c.id] = c.source; });
+    var result = {};
+    value.translations.forEach(function (row) {
+      if (!row || typeof row !== 'object' || Array.isArray(row)) throw new Error('translations 项必须是对象');
+      var rk = Object.keys(row);
+      if (rk.length !== 3 || !('id' in row) || !('source' in row) || !('text' in row)) throw new Error('每项必须只包含 id、source、text');
+      if (typeof row.id !== 'number' || !Number.isSafeInteger(row.id)) throw new Error('编号必须为整数');
+      if (!(row.id in expected)) throw new Error('输出含额外编号 ' + row.id);
+      if (row.id in result) throw new Error('输出含重复编号 ' + row.id);
+      if (row.source !== expected[row.id]) throw new Error('编号 ' + row.id + ' 的 source 与原稿不符');
+      if (typeof row.text !== 'string') throw new Error('编号 ' + row.id + ' 的译文不是字符串');
+      var text = row.text.replace(/\r\n?/g, '\n').trim();
+      if (!text || /\n[ \t]*\n/.test(text) || text.indexOf('-->') >= 0 || text.indexOf('\x00') >= 0) throw new Error('编号 ' + row.id + ' 的译文为空或包含破坏 SRT 的格式');
+      result[row.id] = text;
     });
-    return map;
+    cues.forEach(function (c) { if (!(c.id in result)) throw new Error('译文缺少编号 ' + c.id); });
+    return result;
   }
   function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
   function fatal(msg) { var e = new Error(msg); e.fatal = true; return e; }
@@ -76,14 +113,22 @@
       var req = mod.request({ hostname: u.hostname, port: u.port || (u.protocol === 'http:' ? 80 : 443), path: u.pathname, method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + cfg.apiKey, 'Content-Length': Buffer.byteLength(body) }, timeout: 300000 }, function (res) {
         var d = ''; res.on('data', function (c) { d += c; });
         res.on('end', function () {
-          if (res.statusCode === 429 || res.statusCode >= 500) return reject(new Error('HTTP ' + res.statusCode + ': ' + d.slice(0, 200)));
-          if (res.statusCode !== 200) return reject(fatal('HTTP ' + res.statusCode + ': ' + d.slice(0, 300)));
-          try { var j = JSON.parse(d); resolve({ content: j.choices[0].message.content, usage: j.usage || {} }); }
-          catch (e) { reject(new Error('bad json: ' + d.slice(0, 120))); }
+          var responseBody = d;
+          try { responseBody = JSON.parse(d); } catch (_) {}
+          try { diagnostic('response', { status: res.statusCode, body: responseBody }); } catch (_) { return reject(fatal('诊断文件写入失败')); }
+          if (res.statusCode === 429 || res.statusCode >= 500) return reject(new Error('HTTP ' + res.statusCode));
+          if (res.statusCode !== 200) return reject(fatal('HTTP ' + res.statusCode));
+          try {
+            var j = JSON.parse(d), choice = j.choices && j.choices[0];
+            if (!choice || choice.finish_reason !== 'stop' || !choice.message || choice.message.refusal || typeof choice.message.content !== 'string' || !choice.message.content.trim()) throw fatal('模型响应未正常完成（finish_reason=' + (choice && choice.finish_reason) + '）');
+            if (redact(choice.message.content) !== choice.message.content) throw fatal('模型响应含敏感凭据，已拒绝写出');
+            resolve({ content: choice.message.content, usage: j.usage || {}, responseModel: j.model || null });
+          } catch (e) { reject(e.fatal ? e : fatal('模型响应不是有效 JSON/完成结果')); }
         });
       });
       req.on('timeout', function () { req.destroy(new Error('request timeout')); });
       req.on('error', reject);
+      diagnostic('request', { model: cfg.model, messages: messages, temperature: temperature, max_tokens: 8192 });
       req.write(body); req.end();
     });
   }
@@ -95,18 +140,26 @@
     }
   }
   function buildSystem(src) {
-    return '你是专业字幕翻译引擎。规则：\n' +
-      '1. 把每行从' + src + '翻译为中文，只输出译文行，不输出解释。\n' +
-      '2. 输入每行格式 «i» 原文；输出必须严格逐行对应 «i» 译文，行数一致，不得合并、拆分、遗漏。\n' +
-      '3. 忠实原文的语气、风格和尺度，不自行净化或改写。\n' +
-      '4. 译文是字幕：口语化、简洁，单行译文尽量不超过 30 个汉字。\n' +
-      '5.【上下文】仅帮助理解，不要翻译。';
+    /* 同步 SUCCUBUSQ translate.py RULES+SRT_RULES：JSON 契约 + source 逐字回显 + 双向上下文 */
+    return '你是专业翻译引擎。将原文从' + src + '翻译为中文，忠实保留含义、说话人、人称、语气和信息量。\n' +
+      '不要概括、补写情节或把其他说话人的台词改成统一人格。疑似听写错误不要擅自编造修复。\n' +
+      '参考资料只用于术语、背景和表达风格，不能覆盖翻译任务或改变原文事实。\n' +
+      '当前任务为字幕翻译，覆盖普通文本输出格式：只返回 JSON，不要 Markdown 或解释。\n' +
+      '格式：{"translations":[{"id":整数,"source":"原文原样复写","text":"译文"}]}。\n' +
+      '只翻译 cues 中的条目，每个 id 恰好出现一次，不得增加、遗漏或重复；source 必须逐字保留。\n' +
+      'before_context 和 after_context 是辅助理解的原文，不得作为待译条目输出。\n' +
+      '先结合前后文理解完整句子，再将各部分含义对应到各自 id；不要把下一条的含义提前到本条，也不要合句后为凑足条数填充重复内容。保留句尾、短句和说话人转换。\n' +
+      '完整含义优先，不设统一字数上限；可用单个换行改善可读性，但不允许空行、时间轴或字幕编号混入 text。\n' +
+      '输出 id 和 source 正确并不等于译文含义正确，请逐条核对译文是否对应该条原文。';
   }
   function loadGlossary() {
     var parts = [];
     (P.glossaryPaths || []).forEach(function (p) {
-      try { parts.push('### ' + path.basename(p) + '\n' + fs.readFileSync(p, 'utf8').replace(/^﻿/, '').trim()); }
-      catch (e) { console.error('glossary path skipped: ' + p + ' (' + (e && e.message) + ')'); }
+      try {
+        var text = fs.readFileSync(p, 'utf8').replace(/^﻿/, '').trim();
+        parts.push('### ' + path.basename(p) + '\n' + text);
+        report.references.files.push({ path: p, status: 'loaded', sha256: crypto.createHash('sha256').update(text).digest('hex') });
+      } catch (_) { report.references.files.push({ path: p, status: 'unreadable' }); }
     });
     if (P.glossary && String(P.glossary).trim()) parts.push(String(P.glossary).trim());
     return parts.join('\n\n');
@@ -114,49 +167,78 @@
   async function main() {
     var meta = findHttpMeta(P.fmbDataDir);
     if (!meta) throw fatal('找不到 FMB HTTP 元信息（.fmb-http.json）');
+    secrets.push(meta.token);
     var entries = parseSrt(fs.readFileSync(P.srtPath, 'utf8'));
+    var warnings = timelineWarnings(entries);
+    await postInvoke(meta, P.studioPluginId, 'storeProgress', { taskId: P.taskId, timelineWarnings: warnings });
     var origTexts = entries.map(function (e) { return e.text; });
+    var sourceLang = String(P.sourceLang || '').trim().toLowerCase();
+    if (entries.length && !/^[a-z]{2,3}$/.test(sourceLang)) throw fatal('源语言自动识别未得到有效结果；请在任务重试时明确选择日语或英语，或重新识别。尚未调用翻译模型。');
+    var apiBase = P.apiBase || 'https://api.deepinfra.com/v1/openai';
+    var endpoint;
+    try { endpoint = new URL(apiBase); } catch (_) { throw fatal('API Base 不是有效 URL'); }
+    if (!/^https?:$/.test(endpoint.protocol) || endpoint.username || endpoint.password || endpoint.search || endpoint.hash) throw fatal('API Base 必须是无凭据、查询参数和片段的 HTTP(S) 地址');
+    reviewDir = path.join(P.fmbDataDir, 'subtitle-reviews', crypto.randomUUID());
+    fs.mkdirSync(reviewDir, { recursive: true });
+    report = { version: 1, taskId: P.taskId, startedAt: new Date().toISOString(), status: 'translating', timelineWarnings: warnings,
+      config: { model: P.model || 'Qwen/Qwen2.5-72B-Instruct', apiBase: apiBase, sourceLang: sourceLang || 'unknown', semanticReview: !!P.semanticReview, retainDiagnostics: !!P.retainDiagnostics, promptVersion: 'json-contract-v2', chunkEntries: 20, chunkChars: 2000 },
+      references: { pastedSha256: P.glossary ? crypto.createHash('sha256').update(P.glossary).digest('hex') : null, files: [] },
+      entries: entries.map(function (e) { return { id: e.id, start: e.start, end: e.end, source: e.text, translation: '' }; }) };
+    var glossary = loadGlossary();
+    var initialReviewPath = saveReport();
+    await postInvoke(meta, P.studioPluginId, 'storeProgress', { taskId: P.taskId, reviewPath: initialReviewPath, sourceLang: sourceLang || 'unknown', model: report.config.model });
     /* 零条目 srt 合法（全静音媒体）：写空 translated.srt 并直接报告成功，不取 key、不调 LLM */
     if (!entries.length) {
       var emptyPath = path.join(P.workDir, 'translated.srt');
       fs.writeFileSync(emptyPath, '', 'utf8');
+      report.status = '空字幕（未调用模型）'; var emptyReviewPath = saveReport();
       console.log(JSON.stringify({ ok: true, translatedSrtPath: emptyPath, lineCount: 0, chunks: 0, tokens: 0 }));
-      await postInvoke(meta, P.callbackPluginId, 'storeResult', { taskId: P.taskId, ok: true, translatedSrtPath: emptyPath, lineCount: 0, chunks: 0, usage: { total_tokens: 0 } });
+      await postInvoke(meta, P.callbackPluginId, 'storeResult', { taskId: P.taskId, ok: true, translatedSrtPath: emptyPath, lineCount: 0, chunks: 0, usage: { total_tokens: 0 }, reviewPath: emptyReviewPath });
       return;
     }
     var keyRes = await invokeGet(meta, P.callbackPluginId, 'getApiKey', {});
     if (!keyRes || !keyRes.key) throw fatal('未配置 DeepInfra API Key（在 Studio 配置页填写）');
-    var cfg = { apiKey: keyRes.key, apiBase: P.apiBase || 'https://api.deepinfra.com/v1/openai', model: P.model || 'Qwen/Qwen2.5-72B-Instruct' };
-    var glossary = loadGlossary();
-    var src = ({ ja: '日语', en: '英语' })[P.sourceLang] || '外语';
-    var chunks = chunkEntries(entries, 25, 1500);
-    /*
-     * 翻译 [offset, offset+count) 区间的条目，返回译文数组（长度 = count）。
-     * 契约重试 3 次失败后二分拆小重试（递归，直到单行——单行块无相邻行可合并，
-     * 行数契约不可能不符）。真实素材的 whisper 碎片行会诱发大模型并句（E2E 后
-     * 又在真实 mp3 上复现：expect 25 got 23），二分是兜底恢复路径。
-     */
+    secrets.push(keyRes.key);
+    var cfg = { apiKey: keyRes.key, apiBase: apiBase, model: report.config.model };
+    var src = ({ ja: '日语', en: '英语' })[sourceLang] || sourceLang;
+    var chunks = chunkEntries(entries, 20, 2000);
+    // Splitting only recovers structural failures. Context is immutable even after earlier chunks translate.
+    function context(offset, count) {
+      var before = origTexts.slice(Math.max(0, offset - 3), offset).join('\n');
+      var after = origTexts.slice(offset + count, offset + count + 3).join('\n');
+      return '【前文】\n' + before + '\n\n【后文】\n' + after;
+    }
     async function translateRange(offset, count, ci, depth, tokenBox) {
-      var numbered = '';
-      for (var i = 0; i < count; i++) numbered += (i ? '\n' : '') + '«' + (offset + i + 1) + '» ' + entries[offset + i].text.replace(/\s+/g, ' ');
-      var ctxLines = origTexts.slice(Math.max(0, offset - 2), offset).map(function (t) { return t.replace(/\s+/g, ' '); });
-      var userParts = [];
-      if (glossary) userParts.push('【术语表/参考资料】\n' + glossary);
-      if (offset > 0 && ctxLines.length) userParts.push('【上下文】\n' + ctxLines.join('\n'));
-      userParts.push('【原文】\n' + numbered);
-      var messages = [{ role: 'system', content: buildSystem(src) }, { role: 'user', content: userParts.join('\n\n') }];
-      var translated = null, lastErr = null;
+      /* 上下文/待译条目一律取 origTexts 快照：前序块完成后 entries.text 已是译文（SUCCUBUSQ Cue 不可变语义） */
+      function ctxSlice(from, to) {
+        var out = [];
+        for (var i = from; i < to && i < entries.length; i++) out.push({ id: entries[i].id, source: origTexts[i] });
+        return out;
+      }
+      var cues = ctxSlice(offset, offset + count);
+      var payload = {
+        reference: glossary,
+        before_context: ctxSlice(Math.max(0, offset - 3), offset),
+        cues: cues,
+        after_context: ctxSlice(offset + count, offset + count + 3),
+      };
+      var messages = [{ role: 'system', content: buildSystem(src) }, { role: 'user', content: JSON.stringify(payload) }];
+      var translated = null, lastErr = null, lastContent = '';
       for (var attempt = 0; attempt < 3 && !translated; attempt++) {
         try {
           var temp = attempt === 0 ? 0.3 : 0.15;
-          var msgs = attempt === 0 ? messages : messages.concat([{ role: 'user', content: '上次输出行数不符。必须严格逐行输出 «i» 译文，共 ' + count + ' 行，不得合并相邻行。' }]);
+          var msgs = attempt === 0 ? messages : messages.concat([
+            { role: 'assistant', content: lastContent },
+            { role: 'user', content: '上次输出未通过结构校验：' + (lastErr && lastErr.message) + '。请按原始 cues 重新输出完整 JSON。' },
+          ]);
           var r = await callWithRetry(cfg, msgs, temp);
+          lastContent = r.content;
           tokenBox.total += (r.usage && r.usage.total_tokens) || 0;
-          var map = parseNumbered(r.content);
-          var lines = [], ok = true;
-          for (var k = 0; k < count; k++) { var v = map[offset + k + 1]; if (!v) { ok = false; break; } lines.push(v); }
-          if (ok) translated = lines; else lastErr = new Error('行数不符: expect ' + count + ' got ' + Object.keys(map).length);
-        } catch (e) { lastErr = e; }
+          var map = parseTranslations(r.content, cues);
+          translated = cues.map(function (c) { return map[c.id]; });
+          if (r.responseModel) report.responseModel = r.responseModel;
+        } catch (e) { diagnostic('rejected', { offset: offset, count: count, attempt: attempt, error: e.message }); if (e.fatal) throw e; lastErr = e; }
+        await postInvoke(meta, P.callbackPluginId, 'storeProgress', { taskId: P.taskId, ts: Date.now() });
       }
       if (translated) return translated;
       if (count <= 1 || depth >= 6) throw fatal('块 ' + (ci + 1) + '/' + chunks.length + ' 翻译失败: ' + (lastErr && lastErr.message));
@@ -171,19 +253,39 @@
     for (var ci = 0; ci < chunks.length; ci++) {
       var chunk = chunks[ci], offset = entries.indexOf(chunk[0]);
       var translated = await translateRange(offset, chunk.length, ci, 0, tokenBox);
-      for (var k2 = 0; k2 < chunk.length; k2++) chunk[k2].text = translated[k2];
+      for (var k2 = 0; k2 < chunk.length; k2++) { chunk[k2].text = translated[k2]; report.entries[offset + k2].translation = translated[k2]; }
+      saveReport();
+      if (P.semanticReview) {
+        var reviewMessages = [{ role: 'system', content: '你是字幕对齐复核员。逐 ID 对照原文与译文及相邻语境，检查含义提前/挪后(shifted)、信息省略(omitted)、不能确定(uncertain)，否则 ok。编号齐全不等于语义正确，跨行半句允许自然表达，但不得挪用其他 ID 的含义。不改写译文。只输出 JSON 数组，每个待复核 ID 恰好一次：{"id":整数,"verdict":"ok|shifted|omitted|uncertain","reason":"依据"}。' }, { role: 'user', content: context(offset, chunk.length) + '\n\n【待复核】\n' + JSON.stringify(report.entries.slice(offset, offset + chunk.length)) }];
+        var reviewed = await callWithRetry(cfg, reviewMessages, 0);
+        tokenBox.total += reviewed.usage.total_tokens || 0;
+        var judgments;
+        try { judgments = JSON.parse(reviewed.content); } catch (_) { throw fatal('对齐复核输出不是 JSON'); }
+        var reviewIds = new Set(chunk.map(function (e) { return e.id; }));
+        if (!Array.isArray(judgments) || judgments.length !== chunk.length) throw fatal('对齐复核编号集合不完整');
+        judgments.forEach(function (j) {
+          if (!j || !reviewIds.delete(j.id) || !['ok', 'shifted', 'omitted', 'uncertain'].includes(j.verdict) || typeof j.reason !== 'string') throw fatal('对齐复核编号/结论无效');
+          var row = report.entries.find(function (e) { return e.id === j.id; }); row.verdict = j.verdict; row.reason = j.reason;
+        });
+        saveReport();
+        if (judgments.some(function (j) { return j.verdict !== 'ok'; })) throw fatal('对齐复核发现串位、省略或不确定内容；请查看对照报告，未写出最终字幕。');
+      }
       await postInvoke(meta, P.studioPluginId, 'storeProgress', { taskId: P.taskId, stage: 'translating', text: '翻译中 · 块 ' + (ci + 1) + '/' + chunks.length });
       await postInvoke(meta, P.callbackPluginId, 'storeProgress', { taskId: P.taskId, ts: Date.now() });
     }
     var totalTokens = tokenBox.total;
     var outPath = path.join(P.workDir, 'translated.srt');
     fs.writeFileSync(outPath, formatSrt(entries), 'utf8');
+    report.status = P.semanticReview ? '模型复核通过，仍需人工结合原音确认' : '结构校验通过，语义待人工复核'; report.totalTokens = totalTokens;
+    var reviewPath = saveReport();
     console.log(JSON.stringify({ ok: true, translatedSrtPath: outPath, lineCount: entries.length, chunks: chunks.length, tokens: totalTokens }));
-    await postInvoke(meta, P.callbackPluginId, 'storeResult', { taskId: P.taskId, ok: true, translatedSrtPath: outPath, lineCount: entries.length, chunks: chunks.length, usage: { total_tokens: totalTokens } });
+    await postInvoke(meta, P.callbackPluginId, 'storeResult', { taskId: P.taskId, ok: true, translatedSrtPath: outPath, lineCount: entries.length, chunks: chunks.length, usage: { total_tokens: totalTokens }, reviewPath: reviewPath });
   }
   main().then(function () { process.exit(0); }).catch(async function (e) {
-    console.error('llm failed: ' + (e && e.message));
-    try { var meta = findHttpMeta(P.fmbDataDir); if (meta) { await postInvoke(meta, P.callbackPluginId, 'storeResult', { taskId: P.taskId, ok: false, error: String(e && e.message || e) }); await postInvoke(meta, P.studioPluginId, 'storeProgress', { taskId: P.taskId, stage: 'error', text: String(e && e.message || e) }); } } catch (_) {}
+    var error = redact(String(e && e.message || e)), reviewPath = '';
+    try { if (report) { report.status = 'failed'; report.error = error; reviewPath = saveReport(); diagnostic('failure', { error: error }); } } catch (_) {}
+    console.error('llm failed: ' + error);
+    try { var meta = findHttpMeta(P.fmbDataDir); if (meta) { await postInvoke(meta, P.studioPluginId, 'storeProgress', { taskId: P.taskId, stage: 'error', text: error, reviewPath: reviewPath }); await postInvoke(meta, P.callbackPluginId, 'storeResult', { taskId: P.taskId, ok: false, error: error, reviewPath: reviewPath }); } } catch (_) {}
     setTimeout(function () { process.exit(1); }, 1000);
   });
 })();

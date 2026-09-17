@@ -81,7 +81,7 @@ async function _runTask(task) {
     var me2 = tasks2.find(function (t) { return t.taskId === task.taskId; });
     if (me2) {
       me2.status = ok ? 'done' : 'failed';
-      if (ok) { me2.finalPath = _finalPathFor(me2.mediaPath); me2.progressText = '完成'; }
+      if (ok) { me2.finalPath = _finalPathFor(me2.mediaPath); me2.progressText = '完成 · 请结合原音复核对照报告'; }
       else if (!me2.error) me2.error = '工作流执行失败（详见错误日历/日志）';
       me2.finishedAt = Date.now();
       await _saveTasks(tasks2);
@@ -142,6 +142,13 @@ module.exports = {
     var tasks = await _loadTasks();
     var t = tasks.find(function (x) { return x.taskId === (payload && payload.taskId); });
     if (!t) throw new Error('任务不存在');
+    if (t.status === 'asr' || t.status === 'translating' || t.status === 'writing') throw new Error('任务执行中，不能重复启动');
+    if (payload.language != null) {
+      if (!['auto', 'ja', 'en'].includes(payload.language)) throw new Error('不支持的源语言选项');
+      t.language = payload.language;
+    }
+    t.reviewPath = ''; t.sourceLang = ''; t.model = ''; t.finalPath = '';
+    t.timelineWarnings = [];
     t.status = 'queued'; t.error = ''; t.progressText = '排队重试'; t.finishedAt = 0;
     await _saveTasks(tasks);
     return { ok: true };
@@ -195,6 +202,10 @@ module.exports = {
     var tasks = await _loadTasks();
     var t = tasks.find(function (x) { return x.taskId === payload.taskId; });
     if (!t) return { ok: true };
+    if (typeof payload.reviewPath === 'string') t.reviewPath = payload.reviewPath;
+    if (typeof payload.sourceLang === 'string') t.sourceLang = payload.sourceLang;
+    if (typeof payload.model === 'string') t.model = payload.model;
+    if (Array.isArray(payload.timelineWarnings)) t.timelineWarnings = payload.timelineWarnings;
     if (payload.stage === 'asr') t.status = 'asr';
     else if (payload.stage === 'translating') t.status = 'translating';
     else if (payload.stage === 'error') { t.error = payload.text || t.error; }

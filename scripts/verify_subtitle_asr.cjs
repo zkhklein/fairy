@@ -20,14 +20,17 @@ const devIdx=args.indexOf('--device');
 const device=devIdx>=0?args[devIdx+1]:'';
 process.stdout.write('Some banner line\\n');
 if(device==='cuda'){process.stdout.write('CUDA error: no kernel image\\n');process.exit(0);}
-process.stdout.write('Detected language: ja\\n');
-process.stdout.write('Progress: 10.0%\\rProgress: 55.0%');
+process.stdout.write('Detected lang');
+setTimeout(() => {
+process.stdout.write('uage: Japanese\\n');
+process.stdout.write('Progress: 10.0%\\rProgress: 55.0%\\r');
 process.stdout.write('Progress: 100.0%\\r\\n');
-fs.writeFileSync(path.join(outDir,'ep01.srt'),'1\\r\\n00:00:01,000 --> 00:00:02,000\\r\\nこんにちは\\r\\n\\r\\n');
+fs.writeFileSync(path.join(outDir,'ep01.srt'),'1\\r\\n00:00:01,000 --> 00:00:02,000\\r\\nこんにちは\\r\\n\\r\\n45\\r\\n00:05:44,340 --> 00:05:44,340\\r\\nGood morning.\\r\\n\\r\\n');
 process.exit(0);
+}, 40);
 `);
 
-const src = fs.readFileSync(path.join(ROOT, 'plugins-source/subtitle-pipeline/atomic/asr/runner.js.txt'), 'utf8');
+const src = fs.readFileSync(path.join(ROOT, 'plugins-source/subtitle-pipeline/atomic/asr/runner.js.txt'), 'utf8').replace('/*__FMB_SRT__*/', () => fs.readFileSync(path.join(ROOT, 'plugins-source/subtitle-pipeline/shared/srt.js.txt'), 'utf8'));
 const P = {
   taskId: 't_asr', mediaPath, language: 'auto', workDir,
   whisperExe: process.execPath, argsPrefix: [fake], modelDir: tmp,
@@ -36,7 +39,8 @@ const P = {
 const runner = path.join(tmp, '_runner.js');
 fs.writeFileSync(runner, src.replace('/*__FMB_PARAMS__*/', 'var P = ' + JSON.stringify(P) + ';'));
 
-const r = spawnSync(process.execPath, [runner], { encoding: 'utf8', timeout: 60000 });
+const env = { ...process.env, APPDATA: tmp, LOCALAPPDATA: tmp, FMB_HTTP_PORT: '', FMB_HTTP_TOKEN: '' };
+const r = spawnSync(process.execPath, [runner], { env, encoding: 'utf8', timeout: 60000 });
 console.log(r.stdout); console.error(r.stderr);
 if (r.status !== 0) { console.error('FAIL: exit ' + r.status); process.exit(1); }
 const raw = path.join(workDir, 'raw.srt');
@@ -45,4 +49,15 @@ if (!fs.readFileSync(raw, 'utf8').includes('こんにちは')) { console.error('
 let summary; try { summary = JSON.parse(r.stdout.trim().split('\n').pop()); } catch (e) { console.error('FAIL: no json summary'); process.exit(1); }
 if (summary.detectedLanguage !== 'ja') { console.error('FAIL: detectedLanguage=' + summary.detectedLanguage); process.exit(1); }
 if (summary.retriedWithCpu !== true) { console.error('FAIL: CUDA fallback not exercised'); process.exit(1); }
+if (summary.timelineWarnings?.[0]?.id !== 45) throw new Error('ASR must diagnose zero-duration source IDs');
+P.whisperExe = path.join(tmp, 'must-not-launch-missing.exe');
+fs.writeFileSync(runner, src.replace('/*__FMB_PARAMS__*/', () => 'var P = ' + JSON.stringify(P) + ';'));
+const reused = spawnSync(process.execPath, [runner], { env, encoding: 'utf8', timeout: 10000 });
+const reusedSummary = JSON.parse(reused.stdout.trim());
+if (reused.status !== 0 || !reusedSummary.reused || reusedSummary.detectedLanguage !== 'ja') throw new Error('cached ASR must retain detected language without starting whisper');
+if (reusedSummary.timelineWarnings?.[0]?.id !== 45) throw new Error('cached ASR must diagnose zero-duration source IDs');
+P.language = 'en';
+fs.writeFileSync(runner, src.replace('/*__FMB_PARAMS__*/', () => 'var P = ' + JSON.stringify(P) + ';'));
+const override = spawnSync(process.execPath, [runner], { env, encoding: 'utf8', timeout: 10000 });
+if (override.status !== 0 || JSON.parse(override.stdout.trim()).detectedLanguage !== 'en') throw new Error('explicit retry language must override cached detection');
 console.log('PASS asr runner');

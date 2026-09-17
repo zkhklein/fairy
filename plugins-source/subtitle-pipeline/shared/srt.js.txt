@@ -1,0 +1,38 @@
+/* Embedded in Node runners: one strict parser at translation and output boundaries. */
+function parseSrt(text) {
+  var normalized = String(text).replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n').trim();
+  if (!normalized) return [];
+  var seen = new Set();
+  function millis(s) {
+    var a = s.split(/[:,.]/).map(Number);
+    if (a[1] > 59 || a[2] > 59) throw new Error('SRT 时间轴超出范围');
+    return ((a[0] * 60 + a[1]) * 60 + a[2]) * 1000 + a[3];
+  }
+  return normalized.split(/\n[ \t]*\n+/).map(function (block, index) {
+    var lines = block.split('\n');
+    var idText = lines[0].trim(), id = Number(idText);
+    if (!/^[1-9]\d*$/.test(idText) || !Number.isSafeInteger(id) || seen.has(id)) throw new Error('SRT 编号无效或重复，块 ' + (index + 1));
+    seen.add(id);
+    var m = (lines[1] || '').trim().match(/^(\d{2}:\d{2}:\d{2}[,.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,.]\d{3})$/);
+    if (!m || millis(m[2]) < millis(m[1])) throw new Error('SRT 时间轴无效，编号 ' + id);
+    var body = lines.slice(2).join('\n').trim();
+    if (!body) throw new Error('SRT 文本为空，编号 ' + id);
+    return { id: id, start: m[1].replace('.', ','), end: m[2].replace('.', ','), text: body };
+  });
+}
+function formatSrt(entries) {
+  return entries.map(function (e) { return e.id + '\r\n' + e.start + ' --> ' + e.end + '\r\n' + e.text.replace(/\r\n?/g, '\n').replace(/\n/g, '\r\n') + '\r\n'; }).join('\r\n');
+}
+function assertAligned(source, translated) {
+  if (source.length !== translated.length) throw new Error('SRT 原文/译文条目数不一致');
+  source.forEach(function (s, i) {
+    var t = translated[i];
+    if (s.id !== t.id || s.start !== t.start || s.end !== t.end) throw new Error('SRT 原文/译文编号或时间轴不一致，编号 ' + s.id);
+  });
+}
+// Zero duration is a quality warning, not grounds for discarding text or inventing timestamps.
+function timelineWarnings(entries) {
+  return entries.filter(function (e) { return e.start === e.end; }).map(function (e) {
+    return { code: 'zero_duration', id: e.id, start: e.start, end: e.end, message: '零时长：保留原文关联和时间轴，请依据原音人工核查' };
+  });
+}

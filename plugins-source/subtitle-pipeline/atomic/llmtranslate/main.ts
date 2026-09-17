@@ -1,6 +1,7 @@
 /* global hostApi, __hostEnv */
 // @ts-nocheck
 import runnerSrc from './runner.js.txt';
+import srtSrc from '../../shared/srt.js.txt';
 
 var DEFAULT_NODE = 'C:\\Program Files\\nodejs\\node.exe';
 
@@ -25,6 +26,8 @@ module.exports = {
     if (typeof payload.nodePath === 'string') await hostApi.kv.set('config:nodePath', payload.nodePath.trim());
     if (typeof payload.apiBase === 'string') await hostApi.kv.set('config:apiBase', payload.apiBase.trim());
     if (typeof payload.model === 'string') await hostApi.kv.set('config:model', payload.model.trim());
+    if (typeof payload.semanticReview === 'boolean') await hostApi.kv.set('config:semanticReview', String(payload.semanticReview));
+    if (typeof payload.retainDiagnostics === 'boolean') await hostApi.kv.set('config:retainDiagnostics', String(payload.retainDiagnostics));
     if (typeof payload.glossary === 'string') await hostApi.kv.set('config:glossary', payload.glossary);
     if (Array.isArray(payload.glossaryPaths)) await hostApi.kv.set('config:glossaryPaths', JSON.stringify(payload.glossaryPaths.filter(function (p) { return typeof p === 'string' && p.trim(); })));
     return { ok: true };
@@ -36,6 +39,10 @@ module.exports = {
       nodePath: await hostApi.kv.get('config:nodePath') || '',
       apiBase: await hostApi.kv.get('config:apiBase') || '',
       model: await hostApi.kv.get('config:model') || '',
+      effectiveModel: await hostApi.kv.get('config:model') || 'Qwen/Qwen2.5-72B-Instruct',
+      effectiveApiBase: await hostApi.kv.get('config:apiBase') || 'https://api.deepinfra.com/v1/openai',
+      semanticReview: (await hostApi.kv.get('config:semanticReview')) === 'true',
+      retainDiagnostics: (await hostApi.kv.get('config:retainDiagnostics')) === 'true',
       glossary: await hostApi.kv.get('config:glossary') || '',
       glossaryPaths: JSON.parse(await hostApi.kv.get('config:glossaryPaths') || '[]'),
     };
@@ -74,12 +81,15 @@ module.exports = {
 
     var glossaryPaths = [];
     try { glossaryPaths = JSON.parse(await hostApi.kv.get('config:glossaryPaths') || '[]'); } catch (_) {}
-    var script = runnerSrc.replace('/*__FMB_PARAMS__*/', 'var P = ' + JSON.stringify({
+    var params = {
       taskId: taskId, srtPath: payload.srtPath, sourceLang: payload.sourceLang || '', workDir: payload.workDir,
       fmbDataDir: _dataRoot(), callbackPluginId: 'com.fmb.subtitle.llmtranslate', studioPluginId: 'com.fmb.subtitle.studio',
       apiBase: await hostApi.kv.get('config:apiBase') || '', model: await hostApi.kv.get('config:model') || '',
       glossary: await hostApi.kv.get('config:glossary') || '', glossaryPaths: glossaryPaths,
-    }) + ';');
+      semanticReview: (await hostApi.kv.get('config:semanticReview')) === 'true',
+      retainDiagnostics: (await hostApi.kv.get('config:retainDiagnostics')) === 'true',
+    };
+    var script = runnerSrc.replace('/*__FMB_SRT__*/', function () { return srtSrc; }).replace('/*__FMB_PARAMS__*/', function () { return 'var P = ' + JSON.stringify(params) + ';'; });
 
     await hostApi.processes.start({ executablePath: await _nodePath(), args: ['-e', script], detached: true, timeoutMs: 10000 });
 
@@ -91,7 +101,7 @@ module.exports = {
       if (raw) {
         var r = JSON.parse(raw);
         if (!r.ok) throw new Error('llmtranslate: ' + (r.error || 'unknown'));
-        return { ok: true, translatedSrtPath: r.translatedSrtPath, lineCount: r.lineCount, chunks: r.chunks, usage: r.usage };
+        return { ok: true, translatedSrtPath: r.translatedSrtPath, lineCount: r.lineCount, chunks: r.chunks, usage: r.usage, reviewPath: r.reviewPath || '' };
       }
       var beat = await hostApi.kv.get('llmProgress:' + taskId);
       if (beat) lastBeat = Math.max(lastBeat, parseInt(beat, 10) || lastBeat);

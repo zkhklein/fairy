@@ -1,6 +1,11 @@
 /*__FMB_PARAMS__*/
 (function () {
   var fs = require('fs'), path = require('path'), http = require('http'), cp = require('child_process');
+  /*__FMB_SRT__*/
+  function languageCode(value) {
+    var word = String(value || '').toLowerCase();
+    return ({ japanese: 'ja', english: 'en', chinese: 'zh', korean: 'ko', french: 'fr', german: 'de', spanish: 'es', russian: 'ru' })[word] || (/^[a-z]{2,3}$/.test(word) ? word : '');
+  }
   function findHttpMeta(fdd) {
     var c = [];
     if (process.env.FMB_HTTP_PORT && process.env.FMB_HTTP_TOKEN) return { port: +process.env.FMB_HTTP_PORT, token: process.env.FMB_HTTP_TOKEN };
@@ -37,28 +42,46 @@
       if (P.language && P.language !== 'auto') args.push('--language', P.language);
       var child = cp.spawn(P.whisperExe, args, { windowsHide: true });
       var tail = [];
-      function feed(chunk) {
-        /* 进度行走 stdout（stderr 为空），tqdm 以 \r 覆写同行：三种断行符都要切 */
-        String(chunk).split(/\r\n|\r|\n/).forEach(function (line) {
-          if (!line) return;
-          tail.push(line); if (tail.length > 40) tail.shift();
-          onLine(line);
-        });
+      function line(text) {
+        if (!text) return;
+        tail.push(text); if (tail.length > 40) tail.shift();
+        onLine(text);
       }
-      child.stdout.on('data', feed);
-      child.stderr.on('data', feed);
+      function streamReader(stream) {
+        var pending = '';
+        stream.setEncoding('utf8');
+        stream.on('data', function (chunk) {
+          var lines = (pending + chunk).split(/\r\n|\r|\n/); pending = lines.pop();
+          lines.forEach(line);
+        });
+        return function () { line(pending); pending = ''; };
+      }
+      var flushOut = streamReader(child.stdout), flushErr = streamReader(child.stderr);
       child.on('error', function (e) { resolve({ tail: tail.concat([String(e)]) }); });
-      child.on('close', function () { resolve({ tail: tail }); });
+      child.on('close', function () { flushOut(); flushErr(); resolve({ tail: tail }); });
     });
   }
   async function main() {
     var meta = findHttpMeta(P.fmbDataDir);
+    fs.mkdirSync(P.workDir, { recursive: true });
+    var rawPath = path.join(P.workDir, 'raw.srt');
+    var metadataPath = path.join(P.workDir, 'asr-metadata.json');
+    if (fs.existsSync(rawPath)) {
+      var cached = {};
+      try { cached = JSON.parse(fs.readFileSync(metadataPath, 'utf8')); } catch (_) {}
+      var reusedLanguage = languageCode(P.language !== 'auto' ? P.language : (cached.detectedLanguage || P.previousLanguage));
+      var reused = { taskId: P.taskId, ok: true, srtPath: rawPath, detectedLanguage: reusedLanguage, durationMs: 0, reused: true, timelineWarnings: timelineWarnings(parseSrt(fs.readFileSync(rawPath, 'utf8'))) };
+      if (meta) await postInvoke(meta, P.studioPluginId, 'storeProgress', { taskId: P.taskId, timelineWarnings: reused.timelineWarnings });
+      console.log(JSON.stringify(reused));
+      if (meta) await postInvoke(meta, P.callbackPluginId, 'storeResult', reused);
+      return;
+    }
     var detected = '';
     var lastPost = 0;
     var self = P.callbackPluginId, studio = P.studioPluginId;
     var onLine = function (line) {
-      var m = line.match(/Detected language:\s*([A-Za-z]+)/i);
-      if (m) detected = m[1].toLowerCase();
+      var m = line.match(/(?:Detected language|Language detected)\s*[:=]?\s*['"]?([A-Za-z]+)/i);
+      if (m) detected = languageCode(m[1]);
       var p = line.match(/(\d+(?:\.\d+)?)\s*%/);
       var now = Date.now();
       if (p && now - lastPost >= 2000) {
@@ -86,12 +109,22 @@
       console.error('asr failed: no srt produced');
       process.exit(1);
     }
-    var rawPath = path.join(P.workDir, 'raw.srt');
     fs.renameSync(path.join(P.workDir, srt), rawPath);
-    var summary = { ok: true, srtPath: rawPath, detectedLanguage: detected || (P.language !== 'auto' ? P.language : ''), durationMs: Date.now() - startedAt, retriedWithCpu: retried };
+    var summary = { ok: true, srtPath: rawPath, detectedLanguage: languageCode(P.language !== 'auto' ? P.language : detected), durationMs: Date.now() - startedAt, retriedWithCpu: retried, timelineWarnings: timelineWarnings(parseSrt(fs.readFileSync(rawPath, 'utf8'))) };
+    fs.writeFileSync(metadataPath, JSON.stringify({ requestedLanguage: P.language || 'auto', detectedLanguage: summary.detectedLanguage, model: 'large-v3-turbo', timelineWarnings: summary.timelineWarnings }), 'utf8');
+    if (meta) await postInvoke(meta, studio, 'storeProgress', { taskId: P.taskId, sourceLang: summary.detectedLanguage || 'unknown', timelineWarnings: summary.timelineWarnings, text: summary.detectedLanguage ? '识别语言：' + summary.detectedLanguage : '语言识别结果缺失；非空字幕需要指定语言后重试' });
     console.log(JSON.stringify(summary));
     if (meta) await postInvoke(meta, self, 'storeResult', Object.assign({ taskId: P.taskId }, summary));
     process.exit(0);
   }
-  main().catch(function (e) { console.error('asr crashed: ' + (e && e.message)); process.exit(1); });
+  main().catch(async function (e) {
+    var error = String(e && e.message || e);
+    console.error('asr crashed: ' + error);
+    var meta = findHttpMeta(P.fmbDataDir);
+    if (meta) {
+      await postInvoke(meta, P.studioPluginId, 'storeProgress', { taskId: P.taskId, stage: 'error', text: error });
+      await postInvoke(meta, P.callbackPluginId, 'storeResult', { taskId: P.taskId, ok: false, error: error });
+    }
+    process.exit(1);
+  });
 })();

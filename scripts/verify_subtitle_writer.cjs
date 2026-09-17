@@ -9,16 +9,16 @@ const mediaPath = path.join(mediaDir, 'episode01.mp4'); fs.writeFileSync(mediaPa
 const srtPath = path.join(workDir, 'translated.srt');
 fs.writeFileSync(srtPath, '1\r\n00:00:01,000 --> 00:00:03,500\r\n你好世界\r\n\r\n2\n00:00:04,000 --> 00:00:06,000\n第二行\n多行原文已合并\n', 'utf8');
 const rawSrtPath = path.join(workDir, 'raw.srt');
-const rawOrigText = '1\r\n00:00:01,000 --> 00:00:03,500\r\nHello original world\r\n';
+const rawOrigText = '1\r\n00:00:01,000 --> 00:00:03,500\r\nHello original world\r\n\r\n2\r\n00:00:04,000 --> 00:00:06,000\r\nAnother sentence.\r\n';
 fs.writeFileSync(rawSrtPath, rawOrigText, 'utf8');
 fs.writeFileSync(path.join(workDir, '_asr_runner.js'), 'junk'); /* 验证清理 */
 
-const src = fs.readFileSync(path.join(ROOT, 'plugins-source/subtitle-pipeline/atomic/writer/runner.js.txt'), 'utf8');
+const src = fs.readFileSync(path.join(ROOT, 'plugins-source/subtitle-pipeline/atomic/writer/runner.js.txt'), 'utf8').replace('/*__FMB_SRT__*/', () => fs.readFileSync(path.join(ROOT, 'plugins-source/subtitle-pipeline/shared/srt.js.txt'), 'utf8'));
 const P = { taskId: 't_test', mediaPath, translatedSrtPath: srtPath, rawSrtPath, sourceLang: 'en', workDir, fmbDataDir: tmp, callbackPluginId: 'com.fmb.subtitle.writer' };
 const runner = path.join(tmp, '_runner.js');
 fs.writeFileSync(runner, src.replace('/*__FMB_PARAMS__*/', 'var P = ' + JSON.stringify(P) + ';'));
 
-const r = spawnSync(process.execPath, [runner], { encoding: 'utf8' });
+const r = spawnSync(process.execPath, [runner], { env: { ...process.env, APPDATA: tmp, LOCALAPPDATA: tmp, FMB_HTTP_PORT: '', FMB_HTTP_TOKEN: '' }, encoding: 'utf8' });
 console.log(r.stdout); console.error(r.stderr);
 if (r.status !== 0) { console.error('FAIL: runner exit ' + r.status); process.exit(1); }
 

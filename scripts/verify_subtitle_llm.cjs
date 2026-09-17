@@ -1,4 +1,4 @@
-/* llm runner 验收：内置 mock（FMB invoke + DeepInfra），验证分块/契约重试/二分拆块/落盘 */
+/* llm runner 验收：内置 mock（FMB invoke + DeepInfra），验证 JSON 契约/重试/二分拆块/落盘 */
 const fs = require('fs'), path = require('path'), os = require('os'), http = require('http'), { spawn } = require('child_process');
 
 const ROOT = path.resolve(__dirname, '..');
@@ -10,6 +10,7 @@ for (let i = 1; i <= 60; i++) body += i + '\r\n00:0' + (i % 10) + ':00,000 --> 0
 fs.writeFileSync(srtPath, body, 'utf8');
 
 let chunk2Attempts = 0; const seenChunks = [];
+const reply = (res, content) => res.end(JSON.stringify({ choices: [{ finish_reason: 'stop', message: { content } }], usage: { total_tokens: 100 } }));
 const server = http.createServer((req, res) => {
   let d = ''; req.on('data', c => d += c); req.on('end', () => {
     if (req.url.startsWith('/api/v1/plugins/')) {
@@ -19,17 +20,17 @@ const server = http.createServer((req, res) => {
     }
     if (req.url === '/v1/openai/chat/completions') {
       const j = JSON.parse(d);
-      const nums = [...(j.messages[1].content.matchAll(/«(\d+)»/g))].map(m => +m[1]);
-      seenChunks.push(nums.length);
-      const isChunk2 = nums.length > 0 && nums[0] === 26; /* 第 2 块覆盖 1-based 序号 26..50 */
-      if (isChunk2 && ++chunk2Attempts === 1) { res.end(JSON.stringify({ choices: [{ message: { content: '«1» 坏行' } }] })); return; } /* 契约违反→触发重试 */
-      const isFullChunk3 = nums.length === 10 && nums[0] === 51; /* 第 3 块（51..60）整块永久并句：expect 10 got 8 → 二分拆块路径 */
+      const cues = JSON.parse(j.messages[1].content).cues;
+      seenChunks.push(cues.length);
+      const isChunk2 = cues[0].id === 21 && cues.length === 20; /* 第 2 块覆盖 1-based 21..40 */
+      if (isChunk2 && ++chunk2Attempts === 1) { reply(res, '{"translations":[]}'); return; } /* 契约违反（缺全部编号）→ 带坏输出重试 */
+      const isFullChunk3 = cues[0].id === 41 && cues.length === 20; /* 第 3 块（41..60）整块永久 source 串位 → 二分拆块路径 */
       if (isFullChunk3) {
-        const partial = nums.slice(0, 8).map(n => '«' + n + '» 译文' + n).join('\n');
-        res.end(JSON.stringify({ choices: [{ message: { content: partial } }], usage: { total_tokens: 100 } }));
+        const shifted = cues.map((c, i) => ({ id: c.id, source: c.source + (i === 0 ? '（串位）' : ''), text: '译文' + c.id }));
+        reply(res, JSON.stringify({ translations: shifted }));
         return;
       }
-      res.end(JSON.stringify({ choices: [{ message: { content: nums.map(n => '«' + n + '» 译文' + n).join('\n') } }], usage: { total_tokens: 100 } }));
+      reply(res, JSON.stringify({ translations: cues.map(c => ({ id: c.id, source: c.source, text: '译文' + c.id })) }));
       return;
     }
     res.statusCode = 404; res.end('{}');
@@ -38,7 +39,7 @@ const server = http.createServer((req, res) => {
 
 server.listen(0, '127.0.0.1', () => {
   const port = server.address().port;
-  const src = fs.readFileSync(path.join(ROOT, 'plugins-source/subtitle-pipeline/atomic/llmtranslate/runner.js.txt'), 'utf8');
+  const src = fs.readFileSync(path.join(ROOT, 'plugins-source/subtitle-pipeline/atomic/llmtranslate/runner.js.txt'), 'utf8').replace('/*__FMB_SRT__*/', () => fs.readFileSync(path.join(ROOT, 'plugins-source/subtitle-pipeline/shared/srt.js.txt'), 'utf8'));
   const P = {
     taskId: 't_llm', srtPath, sourceLang: 'ja', workDir,
     fmbDataDir: tmp, callbackPluginId: 'com.fmb.subtitle.llmtranslate', studioPluginId: 'com.fmb.subtitle.studio',
@@ -46,7 +47,7 @@ server.listen(0, '127.0.0.1', () => {
   };
   const runner = path.join(tmp, '_runner.js');
   fs.writeFileSync(runner, src.replace('/*__FMB_PARAMS__*/', 'var P = ' + JSON.stringify(P) + ';'));
-  const env = Object.assign({}, process.env, { FMB_HTTP_PORT: String(port), FMB_HTTP_TOKEN: 'x' });
+  const env = Object.assign({}, process.env, { FMB_HTTP_PORT: String(port), FMB_HTTP_TOKEN: 'localtesttoken' });
   /* spawnSync 会冻结本进程事件循环导致内置 mock 无法应答，故用异步 spawn + 超时杀 */
   const child = spawn(process.execPath, [runner], { env });
   let out = '', err = '', killed = false;
@@ -61,10 +62,10 @@ server.listen(0, '127.0.0.1', () => {
     const srt = fs.readFileSync(path.join(workDir, 'translated.srt'), 'utf8');
     if (!srt.includes('译文60')) { console.error('FAIL: missing last entry'); process.exit(1); }
     if (chunk2Attempts < 2) { console.error('FAIL: contract retry not exercised'); process.exit(1); }
-    if (!seenChunks.includes(5)) { console.error('FAIL: split retry not exercised (no 5-line sub-chunk seen)'); process.exit(1); }
-    const m3 = (srt.match(/译文5[1-9]|译文60/g) || []).length;
-    if (m3 < 10) { console.error('FAIL: chunk-3 lines missing after split retry: ' + m3); process.exit(1); }
-    if (seenChunks.length < 3) { console.error('FAIL: expected >=3 chunks (60 条 / 25) + retry'); process.exit(1); }
+    if (!seenChunks.includes(10)) { console.error('FAIL: split retry not exercised (no 10-entry sub-chunk seen)'); process.exit(1); }
+    const m3 = (srt.match(/译文4[1-9]|译文5[0-9]|译文60/g) || []).length;
+    if (m3 < 20) { console.error('FAIL: chunk-3 lines missing after split retry: ' + m3); process.exit(1); }
+    if (seenChunks.length < 3) { console.error('FAIL: expected >=3 chunks (60 条 / 20) + retry'); process.exit(1); }
     console.log('PASS llm runner, chunks=' + JSON.stringify(seenChunks) + ' chunk2Attempts=' + chunk2Attempts);
     process.exit(0);
   });
