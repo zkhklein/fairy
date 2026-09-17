@@ -38,3 +38,22 @@ test('Studio retains task-specific review path and actual requested model', asyn
   assert.equal(task.model, 'actual-request-model'); assert.equal(task.sourceLang, 'ja');
   assert.equal(task.timelineWarnings[0].id, 45);
 });
+test('auto-resume recovers idle mid-state and transient failures, respects cap and non-recoverable errors', async () => {
+  const { api, kv } = plugin('app/studio', { tasks: JSON.stringify([
+    { taskId: 'mid', status: 'translating' },
+    { taskId: 'net', status: 'failed', error: 'llmtranslate: runner timed out (2h)' },
+    { taskId: 'stall', status: 'failed', error: 'asr: 10 分钟无进度，判定停滞' },
+    { taskId: 'contract', status: 'failed', error: '块 3/10 翻译失败: 行数不符: expect 20 got 18' },
+    { taskId: 'auth', status: 'failed', error: 'HTTP 401: unauthorized' },
+    { taskId: 'capped', status: 'failed', error: 'asr: 10 分钟无进度，判定停滞', autoRetries: 3 },
+  ]) });
+  const r = await api.onAutoResume();
+  assert.equal(r.ok, true); assert.equal(r.recovered, 3);
+  const tasks = Object.fromEntries(JSON.parse(kv.get('tasks')).map(t => [t.taskId, t]));
+  assert.equal(tasks.mid.status, 'queued'); assert.ok(tasks.mid.progressText.includes('自动恢复'));
+  assert.equal(tasks.net.status, 'queued'); assert.equal(tasks.stall.status, 'queued');
+  assert.equal(tasks.net.autoRetries, 1);
+  assert.equal(tasks.contract.status, 'failed'); /* 契约失败需人工（看报告） */
+  assert.equal(tasks.auth.status, 'failed'); /* 鉴权类错误不自动重试 */
+  assert.equal(tasks.capped.status, 'failed'); /* 达 3 次上限不再自动 */
+});

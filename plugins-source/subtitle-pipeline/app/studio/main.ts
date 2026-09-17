@@ -2,10 +2,13 @@
 // @ts-nocheck
 
 var WF_BASE = 'wf-subtitle-flow';
+var RECOVERABLE_RE = /timed out|停滞|timeout|HTTP 5\d\d|429|ECONNRESET|socket|network|网络/i;
 var _wfId = null; /* 当前生效的工作流 id（definition 演进时换新版本 id，HostApi 无 workflow update） */
 var TASKS_KEY = 'tasks';
 var _running = false;
+var _runningSince = 0;
 var _timer = null;
+var _resumeTimer = null;
 
 function _dataRoot() {
   var f = typeof __filename === 'string' ? __filename : '';
@@ -65,6 +68,21 @@ async function _ensureWorkflow() {
   }
 }
 
+/*
+ * 自动恢复守护（参考百度上传-自动恢复）：内部 3 分钟 setInterval。
+ * 项目约定 app 插件用 sandbox 内定时器做周期任务，不走 host schedules/workflows
+ * （HTTP enable 路径的 schedules.create 不可靠——百度 uploader 同样 fallback 内部 timer）。
+ * onAutoResume 保持导出：可经 HTTP invoke 手动触发与离线测试。
+ */
+async function _ensureAutoResume() {
+  if (_resumeTimer) clearInterval(_resumeTimer);
+  _resumeTimer = setInterval(function () {
+    Promise.resolve(module.exports.onAutoResume()).catch(function (e) {
+      hostApi.logger.warn('studio auto-resume tick error', { error: e && e.message });
+    });
+  }, 3 * 60 * 1000);
+}
+
 async function _runTask(task) {
   var tasks = await _loadTasks();
   var me = tasks.find(function (t) { return t.taskId === task.taskId; });
@@ -100,13 +118,15 @@ async function _tick() {
   if (!next) return;
   if (_running) return;
   _running = true;
-  try { await _runTask(next); } finally { _running = false; }
+  _runningSince = Date.now();
+  try { await _runTask(next); } finally { _running = false; _runningSince = 0; }
 }
 
 module.exports = {
   async activate(ctx) {
     ctx.hostApi.logger.info('subtitle-studio activated', { pluginId: ctx.pluginId });
     await _ensureWorkflow();
+    await _ensureAutoResume();
     var tasks = await _loadTasks();
     var changed = false;
     tasks.forEach(function (t) {
@@ -117,6 +137,7 @@ module.exports = {
   },
   deactivate() {
     if (_timer) { clearInterval(_timer); _timer = null; }
+    if (_resumeTimer) { clearInterval(_resumeTimer); _resumeTimer = null; }
     hostApi.logger.info('subtitle-studio deactivated', {});
   },
 
@@ -194,6 +215,32 @@ module.exports = {
   },
   async setWriterConfig(payload) {
     return hostApi.plugins.invoke({ pluginId: 'com.fmb.subtitle.writer', method: 'setConfig', payload: payload || {} });
+  },
+
+  /* ---- 自动恢复（参考百度上传-自动恢复）：由 3 分钟 cron 工作流周期调用 ---- */
+  async onAutoResume() {
+    var recovered = 0, unstuck = false;
+    /* 队列解堵守护：串行执行卡死超过 2 小时（远超单任务常规波动）强制放行，防全队列冻结 */
+    if (_running && _runningSince && Date.now() - _runningSince > 2 * 60 * 60 * 1000) {
+      _running = false; _runningSince = 0; unstuck = true;
+      hostApi.logger.warn('studio auto-resume: queue stuck >2h, forced release', {});
+    }
+    var tasks = await _loadTasks();
+    tasks.forEach(function (t) {
+      if ((t.autoRetries || 0) >= 3) return;
+      var midState = t.status === 'asr' || t.status === 'translating' || t.status === 'writing';
+      /* 中间态恢复仅在队列空闲时执行（避免与正在执行的任务并发重跑 whisper） */
+      if (midState && _running) return;
+      var recoverableFailed = t.status === 'failed' && RECOVERABLE_RE.test(t.error || '');
+      if (!midState && !recoverableFailed) return;
+      t.status = 'queued';
+      t.progressText = '自动恢复排队（第 ' + ((t.autoRetries || 0) + 1) + ' 次自动重试）';
+      t.autoRetries = (t.autoRetries || 0) + 1;
+      t.error = '';
+      recovered++;
+    });
+    if (recovered) await _saveTasks(tasks);
+    return { ok: true, recovered: recovered, unstuck: unstuck };
   },
 
   /* ---- runner 回调 ---- */
