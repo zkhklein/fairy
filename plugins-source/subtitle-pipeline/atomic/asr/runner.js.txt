@@ -32,6 +32,32 @@
       return files.length ? files[0] : null;
     } catch (_) { return null; }
   }
+  function toMs(ts) { var a = ts.split(':'), b = a[2].split(','); return ((+a[0]) * 60 + (+a[1])) * 60000 + (+b[0]) * 1000 + (+b[1]); }
+  function fromMs(ms) {
+    function p(n, w) { n = String(n); while (n.length < w) n = '0' + n; return n; }
+    return p(Math.floor(ms / 3600000), 2) + ':' + p(Math.floor(ms % 3600000 / 60000), 2) + ':' + p(Math.floor(ms % 60000 / 1000), 2) + ',' + p(ms % 1000, 3);
+  }
+  /*
+   * 零时长条目修复：VAD 在人声稀疏（环境音为主）媒体上会切出 start==end 的毛刺条目——
+   * 本身不含有效时间信息、播放器中不可见，且会刷满时间轴警告。扩为最小显示时长 500ms
+   * （受下一条起始时间约束）；文本关联与原音依据不变（0ms 本就非真实时长）。
+   */
+  function fixZeroDuration(srtPath) {
+    try {
+      var entries = parseSrt(fs.readFileSync(srtPath, 'utf8'));
+      if (!entries.length) return 0;
+      var changed = 0;
+      for (var i = 0; i < entries.length; i++) {
+        if (entries[i].start !== entries[i].end) continue;
+        var ms = toMs(entries[i].start), endMs = ms + 500;
+        if (entries[i + 1]) { var nMs = toMs(entries[i + 1].start); if (nMs > ms) endMs = Math.min(endMs, nMs); }
+        entries[i].end = fromMs(endMs);
+        changed++;
+      }
+      if (changed) fs.writeFileSync(srtPath, formatSrt(entries), 'utf8');
+      return changed;
+    } catch (_) { return 0; }
+  }
   function runWhisper(device, ct, onLine) {
     return new Promise(function (resolve) {
       /* --model 收模型名，--model_dir 收模型父目录（spike 实测：直传目录会被 exe 当模型名拼接） */
@@ -67,6 +93,7 @@
     var rawPath = path.join(P.workDir, 'raw.srt');
     var metadataPath = path.join(P.workDir, 'asr-metadata.json');
     if (fs.existsSync(rawPath)) {
+      fixZeroDuration(rawPath);
       var cached = {};
       try { cached = JSON.parse(fs.readFileSync(metadataPath, 'utf8')); } catch (_) {}
       var reusedLanguage = languageCode(P.language !== 'auto' ? P.language : (cached.detectedLanguage || P.previousLanguage));
@@ -110,7 +137,8 @@
       process.exit(1);
     }
     fs.renameSync(path.join(P.workDir, srt), rawPath);
-    var summary = { ok: true, srtPath: rawPath, detectedLanguage: languageCode(P.language !== 'auto' ? P.language : detected), durationMs: Date.now() - startedAt, retriedWithCpu: retried, timelineWarnings: timelineWarnings(parseSrt(fs.readFileSync(rawPath, 'utf8'))) };
+    var fixedZero = fixZeroDuration(rawPath);
+    var summary = { ok: true, srtPath: rawPath, detectedLanguage: languageCode(P.language !== 'auto' ? P.language : detected), durationMs: Date.now() - startedAt, retriedWithCpu: retried, fixedZeroDuration: fixedZero, timelineWarnings: timelineWarnings(parseSrt(fs.readFileSync(rawPath, 'utf8'))) };
     fs.writeFileSync(metadataPath, JSON.stringify({ requestedLanguage: P.language || 'auto', detectedLanguage: summary.detectedLanguage, model: 'large-v3-turbo', timelineWarnings: summary.timelineWarnings }), 'utf8');
     if (meta) await postInvoke(meta, studio, 'storeProgress', { taskId: P.taskId, sourceLang: summary.detectedLanguage || 'unknown', timelineWarnings: summary.timelineWarnings, text: summary.detectedLanguage ? '识别语言：' + summary.detectedLanguage : '语言识别结果缺失；非空字幕需要指定语言后重试' });
     console.log(JSON.stringify(summary));

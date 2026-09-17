@@ -25,7 +25,7 @@ setTimeout(() => {
 process.stdout.write('uage: Japanese\\n');
 process.stdout.write('Progress: 10.0%\\rProgress: 55.0%\\r');
 process.stdout.write('Progress: 100.0%\\r\\n');
-fs.writeFileSync(path.join(outDir,'ep01.srt'),'1\\r\\n00:00:01,000 --> 00:00:02,000\\r\\nこんにちは\\r\\n\\r\\n45\\r\\n00:05:44,340 --> 00:05:44,340\\r\\nGood morning.\\r\\n\\r\\n');
+fs.writeFileSync(path.join(outDir,'ep01.srt'),'1\\r\\n00:00:01,000 --> 00:00:02,000\\r\\nこんにちは\\r\\n\\r\\n45\\r\\n00:05:44,340 --> 00:05:44,340\\r\\nGood morning.\\r\\n\\r\\n73\\r\\n00:08:18,010 --> 00:08:18,010\\r\\nHi.\\r\\n\\r\\n74\\r\\n00:08:18,010 --> 00:08:18,010\\r\\nThere.\\r\\n\\r\\n');
 process.exit(0);
 }, 40);
 `);
@@ -49,13 +49,19 @@ if (!fs.readFileSync(raw, 'utf8').includes('こんにちは')) { console.error('
 let summary; try { summary = JSON.parse(r.stdout.trim().split('\n').pop()); } catch (e) { console.error('FAIL: no json summary'); process.exit(1); }
 if (summary.detectedLanguage !== 'ja') { console.error('FAIL: detectedLanguage=' + summary.detectedLanguage); process.exit(1); }
 if (summary.retriedWithCpu !== true) { console.error('FAIL: CUDA fallback not exercised'); process.exit(1); }
-if (summary.timelineWarnings?.[0]?.id !== 45) throw new Error('ASR must diagnose zero-duration source IDs');
+/* 零时长修复：45/73/74 全部扩为 500ms（73/74 同起始 → 不受下一条约束），警告随之消失 */
+if (summary.fixedZeroDuration !== 3) { console.error('FAIL: fixedZeroDuration=' + summary.fixedZeroDuration); process.exit(1); }
+if ((summary.timelineWarnings || []).length) { console.error('FAIL: zero-duration warnings remain after fix'); process.exit(1); }
+const rawText = fs.readFileSync(raw, 'utf8');
+if (!rawText.includes('00:05:44,340 --> 00:05:44,840')) { console.error('FAIL: id 45 not extended to 500ms'); process.exit(1); }
+if (!rawText.includes('00:08:18,010 --> 00:08:18,510')) { console.error('FAIL: consecutive zero-duration ids not extended'); process.exit(1); }
+if (!rawText.includes('Good morning.')) { console.error('FAIL: zero-duration text lost'); process.exit(1); }
 P.whisperExe = path.join(tmp, 'must-not-launch-missing.exe');
 fs.writeFileSync(runner, src.replace('/*__FMB_PARAMS__*/', () => 'var P = ' + JSON.stringify(P) + ';'));
 const reused = spawnSync(process.execPath, [runner], { env, encoding: 'utf8', timeout: 10000 });
 const reusedSummary = JSON.parse(reused.stdout.trim());
 if (reused.status !== 0 || !reusedSummary.reused || reusedSummary.detectedLanguage !== 'ja') throw new Error('cached ASR must retain detected language without starting whisper');
-if (reusedSummary.timelineWarnings?.[0]?.id !== 45) throw new Error('cached ASR must diagnose zero-duration source IDs');
+if ((reusedSummary.timelineWarnings || []).length) throw new Error('cached ASR must stay zero-duration-free after fix');
 P.language = 'en';
 fs.writeFileSync(runner, src.replace('/*__FMB_PARAMS__*/', () => 'var P = ' + JSON.stringify(P) + ';'));
 const override = spawnSync(process.execPath, [runner], { env, encoding: 'utf8', timeout: 10000 });
