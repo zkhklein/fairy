@@ -300,3 +300,30 @@ for (const [name, input] of [
 ]) {
   test('strict source parser rejects ' + name, () => assert.throws(() => srtApi.parseSrt(input)));
 }
+test('diarization prefixes feed speaker context, stripped from output and source', async t => {
+  const r = await scenario(t, { srt: srt(['[SPEAKER_01]: Hello there.', '[SPEAKER_02]: Nice to meet you.', '[SPEAKER_02]: The weather is fine.']), respond: body => {
+    const payload = JSON.parse(body.messages[1].content);
+    if (payload.cues) {
+      assert.ok(payload.cues.every(c => c.speaker === 'SPEAKER_01' || c.speaker === 'SPEAKER_02'), 'cue speaker expected');
+      assert.match(body.messages[0].content, /声学说话人代号/);
+      return completion(JSON.stringify({ translations: payload.cues.map(c => ({ id: c.id, source: c.source, text: '[SPEAKER_' + c.id + ']: 泄漏' + c.id })) }));
+    }
+    return completion('[]');
+  } });
+  assert.equal(r.code, 0, r.output);
+  const text = fs.readFileSync(path.join(r.workDir, 'translated.srt'), 'utf8');
+  assert.ok(!/\[SPEAKER_\d+\]/.test(text), 'speaker prefix leaked into translated srt');
+  assert.match(text, /泄漏1/);
+  const report = JSON.parse(fs.readFileSync(path.join(path.dirname(r.result.reviewPath), 'review.json'), 'utf8'));
+  assert.equal(report.config.speakerInfo.speakers, 2);
+  const r2 = await scenario(t, { srt: srt(['[SPEAKER_01]: Solo line one.', '[SPEAKER_01]: Solo line two.']), respond: body => {
+    const payload = JSON.parse(body.messages[1].content);
+    if (payload.cues) {
+      assert.ok(payload.cues.every(c => !('speaker' in c)), 'single-speaker diarization must be degraded');
+      assert.doesNotMatch(body.messages[0].content, /声学说话人代号/);
+      return completion(JSON.stringify({ translations: payload.cues.map(c => ({ id: c.id, source: c.source, text: '单' + c.id })) }));
+    }
+    return completion('[]');
+  } });
+  assert.equal(r2.code, 0, r2.output);
+});

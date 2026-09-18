@@ -9,7 +9,7 @@ const mediaPath = path.join(mediaDir, 'episode01.mp4'); fs.writeFileSync(mediaPa
 const srtPath = path.join(workDir, 'translated.srt');
 fs.writeFileSync(srtPath, '1\r\n00:00:01,000 --> 00:00:03,500\r\n你好世界\r\n\r\n2\n00:00:04,000 --> 00:00:06,000\n第二行\n多行原文已合并\n', 'utf8');
 const rawSrtPath = path.join(workDir, 'raw.srt');
-const rawOrigText = '1\r\n00:00:01,000 --> 00:00:03,500\r\nHello original world\r\n\r\n2\r\n00:00:04,000 --> 00:00:06,000\r\nAnother sentence.\r\n';
+const rawOrigText = '1\r\n00:00:01,000 --> 00:00:03,500\r\n[SPEAKER_01]: Hello original world\r\n\r\n2\r\n00:00:04,000 --> 00:00:06,000\r\n[SPEAKER_02]: Another sentence.\r\n';
 fs.writeFileSync(rawSrtPath, rawOrigText, 'utf8');
 fs.writeFileSync(path.join(workDir, '_asr_runner.js'), 'junk'); /* 验证清理 */
 
@@ -28,7 +28,7 @@ const origPath = path.join(mediaDir, 'episode01.en.srt');
 if (!fs.existsSync(origPath)) { console.error('FAIL: original-language srt missing'); process.exit(1); }
 const origText = fs.readFileSync(origPath, 'utf8');
 if (!origText.includes('Hello original world')) { console.error('FAIL: original srt content'); process.exit(1); }
-if (rawOrigText !== origText) { console.error('FAIL: original srt not identical to raw'); process.exit(1); }
+if (/\[SPEAKER_\d+\]/.test(origText)) { console.error('FAIL: speaker prefix leaked into original-language srt'); process.exit(1); }
 const raw = fs.readFileSync(finalPath);
 if (raw[0] === 0xEF && raw[1] === 0xBB) { console.error('FAIL: BOM present'); process.exit(1); }
 const text = raw.toString('utf8');

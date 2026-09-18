@@ -138,6 +138,7 @@ module.exports = {
     cfgPanel.appendChild(sectionHeader('ASR 引擎', '留空则使用 PotPlayer 自带的引擎与模型（自动探测默认路径）'));
     var rWexe = cfgRow('Whisper 引擎路径', '', '例 %APPDATA%\\PotPlayerMini64\\Engine\\Faster-Whisper-XXL\\faster-whisper-xxl.exe', false);
     var rWmodel = cfgRow('Whisper 模型父目录', '', '例 %APPDATA%\\PotPlayerMini64\\Model', false);
+    var cDiarize = checkRow('fmb-cfg-diarize', '说话人分离（对话类音频更准）', '识别 [SPEAKER_NN] 标记辅助翻译判断对话轮次；最终字幕不显示；单人/重叠语音自动降级；首次启用约多花几分钟下载模型（约 423MB，之后离线可用）');
     cfgPanel.appendChild(rWexe.row);
     cfgPanel.appendChild(rWmodel.row);
 
@@ -175,6 +176,7 @@ module.exports = {
         rWexe.input.value = r.whisperExe || '';
         rWmodel.input.value = r.whisperModelDir || '';
         rNode.input.value = r.nodePath || '';
+        cDiarize.box.checked = !!r.diarize;
       }).catch(function () {});
       hostApi.callPluginMainAction('getLlmConfig', {}).then(function (r) {
         if (!r) return;
@@ -201,6 +203,7 @@ module.exports = {
         whisperExe: rWexe.input.value,
         whisperModelDir: rWmodel.input.value,
         nodePath: rNode.input.value,
+        diarize: cDiarize.box.checked,
       }));
       jobs.push(hostApi.callPluginMainAction('setLlmConfig', {
         model: rModel.input.value,

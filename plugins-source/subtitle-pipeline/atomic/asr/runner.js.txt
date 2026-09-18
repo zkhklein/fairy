@@ -66,6 +66,8 @@
         '--print_progress', '--vad_filter', 'true', '--standard_asia', '--device', device, '--compute_type', ct,
       ]);
       if (P.language && P.language !== 'auto') args.push('--language', P.language);
+      /* 说话人分离（reverb_v2 后端零 HF token；模型首次运行自动下载 ~423MB 缓存到引擎目录） */
+      if (P.diarize) args.push('--diarize', 'reverb_v2');
       var child = cp.spawn(P.whisperExe, args, { windowsHide: true });
       var tail = [];
       function line(text) {
@@ -87,6 +89,22 @@
       child.on('close', function () { flushOut(); flushErr(); resolve({ tail: tail }); });
     });
   }
+  /* diarization 统计：raw.srt 保留 [SPEAKER_NN]: 前缀（单一事实源，llmtranslate/writer 各自剥离） */
+  function speakerStats(entries) {
+    var set = {}, last = null, switches = 0, marked = 0;
+    entries.forEach(function (e) {
+      var m = (e.text || '').match(/^\[SPEAKER_(\d+)\]:?\s*/);
+      if (!m) return;
+      marked++;
+      if (last !== null && m[1] !== last) switches++;
+      last = m[1];
+      set[m[1]] = 1;
+    });
+    var count = Object.keys(set).length;
+    var durMin = entries.length ? (entries[entries.length - 1].end - entries[0].start) / 60000 : 0;
+    var rate = durMin > 0 ? switches / durMin : 0;
+    return { diarized: marked > 0, speakers: count, switches: switches, switchRatePerMin: Math.round(rate * 10) / 10 };
+  }
   async function main() {
     var meta = findHttpMeta(P.fmbDataDir);
     fs.mkdirSync(P.workDir, { recursive: true });
@@ -97,7 +115,7 @@
       var cached = {};
       try { cached = JSON.parse(fs.readFileSync(metadataPath, 'utf8')); } catch (_) {}
       var reusedLanguage = languageCode(P.language !== 'auto' ? P.language : (cached.detectedLanguage || P.previousLanguage));
-      var reused = { taskId: P.taskId, ok: true, srtPath: rawPath, detectedLanguage: reusedLanguage, durationMs: 0, reused: true, timelineWarnings: timelineWarnings(parseSrt(fs.readFileSync(rawPath, 'utf8'))) };
+      var reused = { taskId: P.taskId, ok: true, srtPath: rawPath, detectedLanguage: reusedLanguage, durationMs: 0, reused: true, speakerInfo: speakerStats(parseSrt(fs.readFileSync(rawPath, 'utf8'))), timelineWarnings: timelineWarnings(parseSrt(fs.readFileSync(rawPath, 'utf8'))) };
       if (meta) await postInvoke(meta, P.studioPluginId, 'storeProgress', { taskId: P.taskId, timelineWarnings: reused.timelineWarnings });
       console.log(JSON.stringify(reused));
       if (meta) await postInvoke(meta, P.callbackPluginId, 'storeResult', reused);
@@ -138,7 +156,7 @@
     }
     fs.renameSync(path.join(P.workDir, srt), rawPath);
     var fixedZero = fixZeroDuration(rawPath);
-    var summary = { ok: true, srtPath: rawPath, detectedLanguage: languageCode(P.language !== 'auto' ? P.language : detected), durationMs: Date.now() - startedAt, retriedWithCpu: retried, fixedZeroDuration: fixedZero, timelineWarnings: timelineWarnings(parseSrt(fs.readFileSync(rawPath, 'utf8'))) };
+    var summary = { ok: true, srtPath: rawPath, detectedLanguage: languageCode(P.language !== 'auto' ? P.language : detected), durationMs: Date.now() - startedAt, retriedWithCpu: retried, fixedZeroDuration: fixedZero, speakerInfo: speakerStats(parseSrt(fs.readFileSync(rawPath, 'utf8'))), timelineWarnings: timelineWarnings(parseSrt(fs.readFileSync(rawPath, 'utf8'))) };
     fs.writeFileSync(metadataPath, JSON.stringify({ requestedLanguage: P.language || 'auto', detectedLanguage: summary.detectedLanguage, model: 'large-v3-turbo', timelineWarnings: summary.timelineWarnings }), 'utf8');
     if (meta) await postInvoke(meta, studio, 'storeProgress', { taskId: P.taskId, sourceLang: summary.detectedLanguage || 'unknown', timelineWarnings: summary.timelineWarnings, text: summary.detectedLanguage ? '识别语言：' + summary.detectedLanguage : '语言识别结果缺失；非空字幕需要指定语言后重试' });
     console.log(JSON.stringify(summary));

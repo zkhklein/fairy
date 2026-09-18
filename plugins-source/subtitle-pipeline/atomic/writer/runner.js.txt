@@ -47,7 +47,8 @@
       var origPath = path.join(mediaDir, stem + '.' + lang + '.srt');
       try {
         var rawText = fs.readFileSync(P.rawSrtPath, 'utf8');
-        fs.writeFileSync(origPath, rawText.replace(/^﻿/, '').replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/\n/g, '\r\n'), 'utf8');
+        /* 剥离 diarization 前缀：最终字幕不显示说话人标记（raw.srt 保留前缀作为单一事实源） */
+        fs.writeFileSync(origPath, rawText.replace(/^﻿/, '').replace(/^\[SPEAKER_\d+\]:?\s*/gm, '').replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/\n/g, '\r\n'), 'utf8');
         result.origPath = origPath;
         result.origLang = lang;
       } catch (e2) { console.error('orig srt copy failed: ' + (e2 && e2.message)); }

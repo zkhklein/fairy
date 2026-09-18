@@ -37,6 +37,7 @@ module.exports = {
     if (typeof payload.nodePath === 'string') await hostApi.kv.set('config:nodePath', payload.nodePath.trim());
     if (typeof payload.whisperExe === 'string') await hostApi.kv.set('config:whisperExe', payload.whisperExe.trim());
     if (typeof payload.whisperModelDir === 'string') await hostApi.kv.set('config:whisperModelDir', payload.whisperModelDir.trim());
+    if (payload.diarize != null) await hostApi.kv.set('config:diarize', payload.diarize ? '1' : '0');
     return { ok: true };
   },
 
@@ -46,6 +47,7 @@ module.exports = {
       whisperExe: await hostApi.kv.get('config:whisperExe') || '',
       whisperModelDir: await hostApi.kv.get('config:whisperModelDir') || '',
       nodePath: await hostApi.kv.get('config:nodePath') || '',
+      diarize: (await hostApi.kv.get('config:diarize')) === '1',
     };
   },
 
@@ -82,6 +84,7 @@ module.exports = {
     var params = {
       taskId: taskId, mediaPath: payload.mediaPath, language: language, workDir: payload.workDir,
       whisperExe: await _whisperExe(), modelDir: await _modelDir(),
+      diarize: (await hostApi.kv.get('config:diarize')) === '1',
       fmbDataDir: _dataRoot(), callbackPluginId: 'com.fmb.subtitle.asr', studioPluginId: 'com.fmb.subtitle.studio',
       previousLanguage: previousLanguage,
     };

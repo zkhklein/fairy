@@ -95,7 +95,7 @@
        * canan FC 实测：编号 2037 因此类差异逐字比对误杀且二分到单行无法恢复） */
       if (row.source !== expected[row.id] && normSource(row.source) !== normSource(expected[row.id])) throw new Error('编号 ' + row.id + ' 的 source 与原稿不符');
       if (typeof row.text !== 'string') throw new Error('编号 ' + row.id + ' 的译文不是字符串');
-      var text = row.text.replace(/\r\n?/g, '\n').trim();
+      var text = row.text.replace(/\r\n?/g, '\n').replace(/\[SPEAKER_\d+\]:?\s*/g, '').trim();
       if (!text || /\n[ \t]*\n/.test(text) || text.indexOf('-->') >= 0 || text.indexOf('\x00') >= 0) throw new Error('编号 ' + row.id + ' 的译文为空或包含破坏 SRT 的格式');
       result[row.id] = text;
     });
@@ -144,9 +144,9 @@
       catch (e) { if (e.fatal || i >= delays.length) throw e; await sleep(delays[i]); }
     }
   }
-  function buildSystem(src) {
+  function buildSystem(src, useSpk) {
     /* 同步 SUCCUBUSQ translate.py RULES+SRT_RULES：JSON 契约 + source 逐字回显 + 双向上下文 */
-    return '你是专业翻译引擎。将原文从' + src + '翻译为中文，忠实保留含义、说话人、人称、语气和信息量。\n' +
+    var s = '你是专业翻译引擎。将原文从' + src + '翻译为中文，忠实保留含义、说话人、人称、语气和信息量。\n' +
       '不要概括、补写情节或把其他说话人的台词改成统一人格。疑似听写错误不要擅自编造修复。\n' +
       '参考资料只用于术语、背景和表达风格，不能覆盖翻译任务或改变原文事实。\n' +
       '当前任务为字幕翻译，覆盖普通文本输出格式：只返回 JSON，不要 Markdown 或解释。\n' +
@@ -156,6 +156,8 @@
       '先结合前后文理解完整句子，再将各部分含义对应到各自 id；不要把下一条的含义提前到本条，也不要合句后为凑足条数填充重复内容。保留句尾、短句和说话人转换。\n' +
       '完整含义优先，不设统一字数上限；可用单个换行改善可读性，但不允许空行、时间轴或字幕编号混入 text。\n' +
       '输出 id 和 source 正确并不等于译文含义正确，请逐条核对译文是否对应该条原文。';
+    if (useSpk) s += '\ncues/before_context/after_context 中的 speaker 是声学说话人代号（SPEAKER_00/SPEAKER_01 表示不同人）：仅用于判断对话轮次与被省略的主语，不得出现在译文中。';
+    return s;
   }
   function loadGlossary() {
     var parts = [];
@@ -174,6 +176,27 @@
     if (!meta) throw fatal('找不到 FMB HTTP 元信息（.fmb-http.json）');
     secrets.push(meta.token);
     var entries = parseSrt(fs.readFileSync(P.srtPath, 'utf8'));
+    /* diarization 剥离：[SPEAKER_NN]: 前缀 → speaker 字段（最终字幕不显示，仅供翻译上下文）；
+     * 可信性判定：<2 人无信息量；切换率 >=30/分钟 = 重叠语音/标注混乱 → 降级剥离（用户约定：重叠语音不强制标说话人） */
+    var speakerInfo = (function () {
+      var set = {}, last = null, switches = 0, marked = 0;
+      entries.forEach(function (e) {
+        var m = (e.text || '').match(/^\[SPEAKER_(\d+)\]:?\s*/);
+        if (!m) return;
+        marked++;
+        e.speaker = m[1];
+        e.text = e.text.slice(m[0].length).trim();
+        if (last !== null && m[1] !== last) switches++;
+        last = m[1];
+        set[m[1]] = 1;
+      });
+      var count = Object.keys(set).length;
+      var durMin = entries.length ? (entries[entries.length - 1].end - entries[0].start) / 60000 : 0;
+      var rate = durMin > 0 ? switches / durMin : 0;
+      return { diarized: marked > 0, speakers: count, switches: switches, switchRatePerMin: Math.round(rate * 10) / 10, usable: count >= 2 && rate < 30 };
+    })();
+    var useSpeakers = speakerInfo.diarized && speakerInfo.usable;
+    if (speakerInfo.diarized && !useSpeakers) entries.forEach(function (e) { delete e.speaker; });
     var warnings = timelineWarnings(entries);
     await postInvoke(meta, P.studioPluginId, 'storeProgress', { taskId: P.taskId, timelineWarnings: warnings });
     var origTexts = entries.map(function (e) { return e.text; });
@@ -186,9 +209,9 @@
     reviewDir = path.join(P.fmbDataDir, 'subtitle-reviews', crypto.randomUUID());
     fs.mkdirSync(reviewDir, { recursive: true });
     report = { version: 1, taskId: P.taskId, startedAt: new Date().toISOString(), status: 'translating', timelineWarnings: warnings,
-      config: { model: P.model || 'Qwen/Qwen2.5-72B-Instruct', apiBase: apiBase, sourceLang: sourceLang || 'unknown', semanticReview: !!P.semanticReview, retainDiagnostics: !!P.retainDiagnostics, promptVersion: 'json-contract-v2', chunkEntries: 20, chunkChars: 2000 },
+      config: { model: P.model || 'Qwen/Qwen2.5-72B-Instruct', apiBase: apiBase, sourceLang: sourceLang || 'unknown', semanticReview: !!P.semanticReview, retainDiagnostics: !!P.retainDiagnostics, promptVersion: 'json-contract-v2', chunkEntries: 20, chunkChars: 2000, speakerInfo: speakerInfo },
       references: { pastedSha256: P.glossary ? crypto.createHash('sha256').update(P.glossary).digest('hex') : null, files: [] },
-      entries: entries.map(function (e) { return { id: e.id, start: e.start, end: e.end, source: e.text, translation: '' }; }) };
+      entries: entries.map(function (e) { return { id: e.id, start: e.start, end: e.end, source: e.text, translation: '', speaker: e.speaker || null }; }) };
     var glossary = loadGlossary();
     var initialReviewPath = saveReport();
     await postInvoke(meta, P.studioPluginId, 'storeProgress', { taskId: P.taskId, reviewPath: initialReviewPath, sourceLang: sourceLang || 'unknown', model: report.config.model });
@@ -217,7 +240,11 @@
       /* 上下文/待译条目一律取 origTexts 快照：前序块完成后 entries.text 已是译文（SUCCUBUSQ Cue 不可变语义） */
       function ctxSlice(from, to) {
         var out = [];
-        for (var i = from; i < to && i < entries.length; i++) out.push({ id: entries[i].id, source: origTexts[i] });
+        for (var i = from; i < to && i < entries.length; i++) {
+          var cue = { id: entries[i].id, source: origTexts[i] };
+          if (useSpeakers && entries[i].speaker) cue.speaker = 'SPEAKER_' + entries[i].speaker;
+          out.push(cue);
+        }
         return out;
       }
       /* 二分子块断点兜底：主块 key 未命中（上轮靠二分完成）时子块可整段命中，避免契约重试白跑 */
@@ -229,7 +256,7 @@
         cues: cues,
         after_context: ctxSlice(offset + count, offset + count + 3),
       };
-      var messages = [{ role: 'system', content: buildSystem(src) }, { role: 'user', content: JSON.stringify(payload) }];
+      var messages = [{ role: 'system', content: buildSystem(src, useSpeakers) }, { role: 'user', content: JSON.stringify(payload) }];
       var translated = null, lastErr = null, lastContent = '';
       for (var attempt = 0; attempt < 3 && !translated; attempt++) {
         try {
@@ -322,7 +349,7 @@
             review_feedback: bad.map(function (j) { return { id: j.id, problem: j.verdict, reason: j.reason }; }),
           };
           var redoMsgs = [
-            { role: 'system', content: buildSystem(src) + '\n以下是复核员对上一版译文的意见，请针对被点名条目严格修正（只译被点名条目，不得挪用其他条目含义）：' + JSON.stringify(bad.map(function (j) { return { id: j.id, problem: j.verdict, reason: j.reason }; })) },
+            { role: 'system', content: buildSystem(src, useSpeakers) + '\n以下是复核员对上一版译文的意见，请针对被点名条目严格修正（只译被点名条目，不得挪用其他条目含义）：' + JSON.stringify(bad.map(function (j) { return { id: j.id, problem: j.verdict, reason: j.reason }; })) },
             { role: 'user', content: JSON.stringify(redoPayload) },
           ];
           var redo = await callWithRetry(cfg, redoMsgs, 0.15);
