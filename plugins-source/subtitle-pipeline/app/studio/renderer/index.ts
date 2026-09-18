@@ -128,8 +128,11 @@ module.exports = {
     cfgPanel.appendChild(keyState);
     var rModel = cfgRow('LLM 模型', '', '默认 Qwen/Qwen2.5-72B-Instruct', false);
     var rApiBase = cfgRow('API Base', '', '默认 https://api.deepinfra.com/v1/openai', false);
+    var rConc = cfgRow('并行度（每池路数，1-6）', '', '默认 3：翻译池与复核池各自并行 N 路；不改变任何单次调用的输入，质量不变仅提速。若出现限流(429)会自动退避重试', false);
+    rConc.input.type = 'number'; rConc.input.min = '1'; rConc.input.max = '6';
     cfgPanel.appendChild(rModel.row);
     cfgPanel.appendChild(rApiBase.row);
+    cfgPanel.appendChild(rConc.row);
     var effective = document.createElement('div');
     effective.style.cssText = 'font-size:12px;color:#6b7280;margin:-6px 0 12px 0;';
     cfgPanel.appendChild(effective);
@@ -145,6 +148,7 @@ module.exports = {
     var cDiarize = checkRow('fmb-cfg-diarize', '说话人分离（对话类音频更准）', '识别 [SPEAKER_NN] 标记辅助翻译判断对话轮次；最终字幕不显示；单人/重叠语音自动降级；首次启用约多花几分钟下载模型（约 423MB，之后离线可用）');
     cfgPanel.appendChild(rWexe.row);
     cfgPanel.appendChild(rWmodel.row);
+    cfgPanel.appendChild(cDiarize.row); /* 0.1.16 修复：勾选框曾漏 append 从未渲染（用户在配置面板找不到此开关） */
 
     /* Section 3: 运行环境 */
     cfgPanel.appendChild(sectionHeader('运行环境'));
@@ -229,6 +233,7 @@ module.exports = {
         if (!r) return;
         rModel.input.value = r.model || '';
         rApiBase.input.value = r.apiBase || '';
+        rConc.input.value = String(r.concurrency || 3);
         effective.textContent = '当前配置（用于后续执行，非历史请求）：' + (r.effectiveModel || '未知') + ' · ' + (r.effectiveApiBase || '未知');
         cReview.box.checked = !!r.semanticReview;
         cDiag.box.checked = !!r.retainDiagnostics;
@@ -256,6 +261,7 @@ module.exports = {
       jobs.push(hostApi.callPluginMainAction('setLlmConfig', {
         model: rModel.input.value,
         apiBase: rApiBase.input.value,
+        concurrency: parseInt(rConc.input.value, 10) || 3,
         glossary: rGlossary.input.value,
         glossaryPaths: gpaths,
         semanticReview: cReview.box.checked,

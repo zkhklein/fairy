@@ -1,0 +1,68 @@
+{
+  "id": "com.fmb.baidunetdisk.uploader",
+  "name": "百度网盘压缩上传",
+  "version": "0.3.10",
+  "type": "app",
+  "description": "App 插件：选择本地文件/文件夹 → 7z 分卷压缩（4092m + 随机密码）→ 上传百度网盘 → 本地清理。提供任务列表、配置、暂停/恢复/删除、复制身份信息，以及每 3 分钟自动恢复可重试中止任务的定时任务。",
+  "permissions": [
+    "log:write",
+    "audit:write",
+    "kv:read",
+    "kv:write",
+    "plugins:read",
+    "plugins:invoke",
+    "workflows:create",
+    "workflows:read",
+    "workflows:execute",
+    "schedules:create",
+    "schedules:write",
+    "schedules:read",
+    "secrets:read",
+    "secrets:write",
+    "extensions:call"
+  ],
+  "dependencies": {
+    "com.fmb.tools.localdb": "^0.1.0",
+    "com.fmb.tools.sevenzip": "^0.1.4",
+    "com.fmb.baidunetdisk.client": "^0.2.5"
+  },
+  "main": "main.js",
+  "renderer": "renderer/index.ts",
+  "extensionPoints": [
+    "schedule.template.com.fmb.baidunetdisk.uploader.scheduled_upload::onScheduledUpload",
+    "schedule.template.com.fmb.baidunetdisk.uploader.auto_resume::onAutoResume"
+  ],
+  "scheduleTemplates": [
+    {
+      "id": "scheduled_upload",
+      "label": "定时上传百度网盘",
+      "description": "按指定时间自动执行上传流程：压缩 → 上传 → 清理。需要先在配置中填写远程根目录和 OAuth 授权。",
+      "defaultCron": "0 2 * * *",
+      "misfirePolicy": "run_now",
+      "targetWorkflowId": "wf-baidu-upload-flow",
+      "paramsSchema": {
+        "sourcePath": {
+          "label": "本地文件/文件夹路径",
+          "description": "要上传的本地文件或文件夹的完整路径",
+          "type": "string",
+          "required": true
+        },
+        "remotePath": {
+          "label": "远程子目录（可选）",
+          "description": "网盘上的目标子目录，留空则上传到远程根目录下",
+          "type": "string",
+          "required": false
+        }
+      }
+    },
+    {
+      "id": "auto_resume",
+      "label": "自动恢复中止任务",
+      "description": "每3分钟扫描一次，自动恢复因意外中止的上传任务（内部机制，不建议手动添加）",
+      "defaultCron": "*/3 * * * *",
+      "misfirePolicy": "skip",
+      "targetWorkflowId": "wf-baidu-uploader-auto-resume",
+      "paramsSchema": {}
+    }
+  ]
+}

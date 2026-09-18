@@ -264,6 +264,7 @@ export default function Schedules(): JSX.Element {
   ];
 
   return (
+    <>
     <PageShell
       loading={(loading && !data) || scheduleTemplatesLoading}
       error={error}
@@ -302,7 +303,12 @@ export default function Schedules(): JSX.Element {
         }}
       />
 
-      <Modal
+    </PageShell>
+
+    {/* Modal lives OUTSIDE PageShell: PageShell replaces children with the Empty
+        state when the list is empty, which would unmount the modal exactly when
+        a fresh page needs it. */}
+    <Modal
         title="添加定时任务"
         open={open}
         onCancel={() => setOpen(false)}
@@ -433,7 +439,7 @@ export default function Schedules(): JSX.Element {
           </Form.Item>
         </Form>
       </Modal>
-    </PageShell>
+    </>
   );
 }
 

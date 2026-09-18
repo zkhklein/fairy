@@ -63,6 +63,17 @@ const SELF_CHECK_MARKER = (() => {
   const arg = process.argv.find((a) => a.startsWith('--fmb-self-check-marker='));
   return arg ? arg.slice('--fmb-self-check-marker='.length) : '';
 })();
+
+// Single-instance lock (P1 fix for the 2026-09-15 dual-instance incident):
+// close-to-tray keeps the first instance alive after its window closes, so a
+// user relaunching the portable exe used to spawn a SECOND full instance on
+// the same fmb-data dir — two schedulers then fired the same schedules and
+// two plugin sandboxes ran competing upload/compress scripts against the same
+// task folders and progress KV keys. Self-check mode is exempt so the
+// packaging harness can still boot a headless instance on a dev machine.
+if (!SELF_CHECK_MODE && !app.requestSingleInstanceLock()) {
+  app.quit();
+}
 try { fs.unlinkSync(MARKER_FILE) } catch { /* noop */ }
 function mk(tag: string, extra?: unknown): void {
   try {
@@ -212,7 +223,7 @@ function createWindow(): void {
   }
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   mk('APP_WHEN_READY_START');
   // 1) Infrastructure boot: Database + migrations + initial audit row
   const bootStart = Date.now();
@@ -283,6 +294,15 @@ app.whenReady().then(() => {
       toggle: (id, enabled) => schedulerSvc.toggle(id, enabled) as unknown as Record<string, unknown> | null,
     });
     mk('SCHEDULER_SERVICE_OK');
+    // Load all plugins that were 'enabled' in a previous session into running
+    // sandboxes now that workflow/schedule callbacks are wired (plugin
+    // activate() may create workflows/schedules). Failures are non-fatal.
+    try {
+      const bootLoad = await pluginSvc.loadEnabledAtBoot();
+      mk('PLUGINS_BOOT_LOADED', { loaded: bootLoad.loaded, failed: bootLoad.failed.length });
+    } catch (err) {
+      mk('PLUGINS_BOOT_LOAD_ERR', { msg: (err as Error).message });
+    }
     const queueSvc = initQueueService(bus);
     mk('QUEUE_SERVICE_OK');
     const errorCalSvc = initErrorCalendarService(bus);
@@ -401,6 +421,16 @@ app.whenReady().then(() => {
       createWindow();
     }
   });
+});
+
+// A relaunched instance was blocked by the single-instance lock — surface the
+// existing window instead (it may be hidden in the tray).
+app.on('second-instance', () => {
+  if (mainWindow) {
+    if (!mainWindow.isVisible()) mainWindow.show();
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.focus();
+  }
 });
 
 app.on('before-quit', () => {

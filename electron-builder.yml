@@ -22,7 +22,7 @@ electronDownload:
 
 directories:
   buildResources: build-resources
-  output: dist10/
+  output: dist/
 
 artifactName: "${productName} ${version} ${arch}.${ext}"
 

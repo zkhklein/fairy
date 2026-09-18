@@ -17,7 +17,7 @@ import { getRawDb } from '../db';
 import { createLogger } from '../logger';
 import type { EventBusService } from '../event-bus';
 import type { WorkflowService } from '../workflow/crud';
-import { parseCron, matchesCron, nextRunTimes, type CronFields, type CronParseError } from './cron-parser';
+import { parseCron, nextRunTimes, type CronFields } from './cron-parser';
 import type { Schedule } from '@shared/index';
 
 const log = createLogger('scheduler');
@@ -199,6 +199,10 @@ export class SchedulerService {
         const next = this.computeNextFire(cronFields, row.one_shot_at, now);
         db.prepare('UPDATE schedules SET next_fired_at=?, last_fired_at=?, updated_at=? WHERE id=?')
           .run(next, now, now, row.id);
+        // Mirror onto the row before register() — otherwise the stale
+        // next_fired_at would immediately satisfy checkShouldFire().
+        row.next_fired_at = next;
+        row.last_fired_at = now;
         if (row.one_shot_at) {
           // One-shot: disable after firing
           db.prepare('UPDATE schedules SET enabled=0 WHERE id=?').run(row.id);
@@ -242,15 +246,13 @@ export class SchedulerService {
   }
 
   private checkShouldFire(entry: ActiveSchedule, now: number): boolean {
-    const { row, cronFields } = entry;
-    // One-shot check
-    if (row.one_shot_at && now >= row.one_shot_at) return true;
-    // Cron check: match current minute
-    if (cronFields) {
-      const date = new Date(now);
-      return matchesCron(date, cronFields);
-    }
-    return false;
+    const { row } = entry;
+    // Fire only when the maintained next_fired_at has been reached. The value
+    // is computed by computeNextFire() (strictly the next matching minute for
+    // cron, or the one-shot timestamp) and mirrored onto entry.row after each
+    // fire — so the 10s tick cannot re-fire multiple times within one matched
+    // cron minute (previously matchesCron(now) re-fired ~6x per matched minute).
+    return row.next_fired_at !== null && now >= row.next_fired_at;
   }
 
   /** Fire a schedule — emit event and execute the associated workflow. */
@@ -265,6 +267,10 @@ export class SchedulerService {
 
     db.prepare('UPDATE schedules SET last_fired_at=?, next_fired_at=?, updated_at=? WHERE id=?')
       .run(now, next, now, row.id);
+    // Mirror onto the in-memory row so checkShouldFire() sees the fresh
+    // next_fired_at on subsequent ticks (active map holds this same object).
+    row.last_fired_at = now;
+    row.next_fired_at = next;
 
     // Emit schedule.triggered with the full Schedule record (matches contract)
     await this.bus.safeEmit('schedule.triggered', { schedule: row as Schedule, fireTimeMs: now, traceId }, { traceId, source: 'scheduler' });

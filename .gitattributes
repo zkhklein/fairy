@@ -1,0 +1,5 @@
+# FMB Windows 开发约定（见 AGENTS.md §4.9）：LF 行尾 + UTF-8 无 BOM
+* text=lf eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf

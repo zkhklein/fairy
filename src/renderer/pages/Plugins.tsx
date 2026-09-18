@@ -55,12 +55,32 @@ export default function Plugins(): JSX.Element {
   const [installOpen, setInstallOpen] = useState(false);
   const [autoEnable, setAutoEnable] = useState(true);
   const [installStage, setInstallStage] = useState<'pick' | 'precheck' | 'done'>('pick');
+  // Bundled dependency overwrite choices: depId → overwrite? Only meaningful
+  // for deps whose status is upgrade/downgrade (a different version is already
+  // installed). new deps install automatically; same-version deps skip.
+  const [depOverwrite, setDepOverwrite] = useState<Record<string, boolean>>({});
   const [keyword, setKeyword] = useState('');
   const [typeFilter, setTypeFilter] = useState<undefined | 'atomic' | 'app' | 'extension'>(undefined);
   const [statusFilter, setStatusFilter] = useState<undefined | string>(undefined);
   const navigate = useNavigate();
 
   useEffect(() => { void list(); }, [list]);
+
+  // Initialize default overwrite choices once prechecks arrive: deps whose
+  // installed version does NOT satisfy the declared range default to checked.
+  useEffect(() => {
+    setDepOverwrite((prev) => {
+      const next = { ...prev };
+      for (const c of preChecks) {
+        for (const d of c.bundledDeps ?? []) {
+          if ((d.status === 'upgrade' || d.status === 'downgrade') && !(d.depId in next)) {
+            next[d.depId] = !!d.requiredOverwrite;
+          }
+        }
+      }
+      return next;
+    });
+  }, [preChecks]);
 
   const filteredRows = useMemo(() => {
     const rows = (data?.items ?? []) as PluginRow[];
@@ -141,6 +161,17 @@ export default function Plugins(): JSX.Element {
       message.warning('部分 zip 无法安装（存在致命问题）。请先移除不合法的 zip 后重试。');
       return;
     }
+    // Guard: a required dependency overwrite the user unchecked will fail the
+    // install anyway — surface it early with a clear message.
+    const missingRequired = preChecks.flatMap((c) =>
+      (c.bundledDeps ?? []).filter((d) => d.requiredOverwrite && !depOverwrite[d.depId]),
+    );
+    if (missingRequired.length > 0) {
+      message.warning(
+        `依赖 ${missingRequired.map((d) => d.depId).join('、')} 的已装版本不满足要求，请勾选覆盖后再安装。`,
+      );
+      return;
+    }
     if (!allOk) {
       const ok: boolean = await new Promise((resolve) => {
         Modal.confirm({
@@ -154,7 +185,8 @@ export default function Plugins(): JSX.Element {
       });
       if (!ok) return;
     }
-    await installBatch({ zipPaths: preChecks.map((c) => c.zipPath), autoEnable });
+    const overwriteDeps = Object.entries(depOverwrite).filter(([, v]) => v).map(([k]) => k);
+    await installBatch({ zipPaths: preChecks.map((c) => c.zipPath), autoEnable, overwriteDeps });
     setInstallStage('done');
     void list();
   };
@@ -263,6 +295,7 @@ export default function Plugins(): JSX.Element {
   ];
 
   return (
+    <>
     <PageShell
       loading={loading && !data}
       error={error}
@@ -367,9 +400,13 @@ export default function Plugins(): JSX.Element {
         }}
       />
       {versionsError && <div style={{ color: 'red', marginTop: 8 }}>{versionsError}</div>}
+    </PageShell>
 
-      {/* ----------------------------- Install Modal ----------------------------- */}
-      <Modal
+    {/* ----------------------------- Install Modal ----------------------------- */}
+    {/* Modal lives OUTSIDE PageShell: PageShell replaces children with the Empty
+        state when the list is empty, which would unmount the modal exactly when
+        a fresh install needs it. */}
+    <Modal
         title="安装插件 zip"
         open={installOpen}
         onCancel={onCloseInstall}
@@ -426,7 +463,16 @@ export default function Plugins(): JSX.Element {
               {preChecksLoading ? (
                 <Alert type="info" showIcon message="正在检查 zip 合法性与依赖..." />
               ) : (
-                preChecks.map((c) => <PreCheckItem key={c.zipPath} check={c} />)
+                preChecks.map((c) => (
+                  <PreCheckItem
+                    key={c.zipPath}
+                    check={c}
+                    depOverwrite={depOverwrite}
+                    onDepOverwriteChange={(depId, checked) =>
+                      setDepOverwrite((prev) => ({ ...prev, [depId]: checked }))
+                    }
+                  />
+                ))
               )}
             </div>
           </Space>
@@ -442,22 +488,38 @@ export default function Plugins(): JSX.Element {
                     : <CloseCircleFilled style={{ color: '#ff4d4f' }} />}{' '}
                   {r.pluginId ?? r.zipPath.slice(r.zipPath.lastIndexOf('\\') + 1)} @ {r.version ?? '?'}
                   {' '}— {(r.errors && r.errors.length > 0 ? r.errors.map((e) => e.message).join('; ') : (r.ok ? '安装成功' : '安装失败'))}
+                  {(r.installedDeps ?? []).length > 0 && (
+                    <div style={{ marginLeft: 22, marginTop: 2, fontSize: 12, color: '#666' }}>
+                      {(r.installedDeps ?? []).map((d) => (
+                        <div key={d.pluginId}>
+                          依赖 {d.pluginId}@{d.version}：
+                          {d.action === 'installed' ? '已自动安装' : d.action === 'overwritten' ? '已覆盖安装' : '保留现有版本'}
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
               ))}
             </div>
           </Space>
         )}
       </Modal>
-    </PageShell>
+    </>
   );
 }
 
 /**
  * Render a single pre-check result card. Translates the structured
  * `depCheck` + `versionStatus` to the UI's status badges, messages, and
- * the dependency list.
+ * the dependency list. App zips embedding `bundledDeps` additionally show
+ * the dependency closure: new deps auto-install, same-version deps skip,
+ * and different-version deps get an overwrite checkbox.
  */
-function PreCheckItem({ check }: { check: MainPluginPreInstallCheckResult }): JSX.Element {
+function PreCheckItem({ check, depOverwrite, onDepOverwriteChange }: {
+  check: MainPluginPreInstallCheckResult;
+  depOverwrite: Record<string, boolean>;
+  onDepOverwriteChange: (depId: string, checked: boolean) => void;
+}): JSX.Element {
   const fatal = !check.ok;
   const hasCycles = (check.depCheck.cycles?.length ?? 0) > 0;
   const hasMissing = (check.depCheck.missing?.length ?? 0) > 0;
@@ -508,6 +570,51 @@ function PreCheckItem({ check }: { check: MainPluginPreInstallCheckResult }): JS
       {down && (
         <div style={{ color: '#d46b08', fontSize: 12, marginTop: 4 }}>
           ⚠ 将要降级（{check.installedVersion ?? 'installed'} → {version}）
+        </div>
+      )}
+      {(check.bundledDeps ?? []).length > 0 && (
+        <div style={{ marginTop: 8 }}>
+          <div style={{ fontSize: 12, marginBottom: 4 }}>
+            内嵌依赖（随本包自动处理）：
+          </div>
+          <ul style={{ margin: 0, paddingLeft: 18, fontSize: 12, listStyle: 'none' }}>
+            {(check.bundledDeps ?? []).map((d) => {
+              const label = `${d.name ? `${d.name}（${d.depId}）` : d.depId} @ v${d.version}`;
+              if (d.status === 'new') {
+                return (
+                  <li key={d.depId} style={{ marginBottom: 4 }}>
+                    <Tag color="blue">将自动安装</Tag>{label}
+                  </li>
+                );
+              }
+              if (d.status === 'same') {
+                return (
+                  <li key={d.depId} style={{ marginBottom: 4 }}>
+                    <Tag color="default">已安装同版本 · 跳过</Tag>{label}
+                  </li>
+                );
+              }
+              // upgrade / downgrade: user chooses whether to overwrite.
+              return (
+                <li key={d.depId} style={{ marginBottom: 4 }}>
+                  <Checkbox
+                    checked={!!depOverwrite[d.depId]}
+                    onChange={(e) => onDepOverwriteChange(d.depId, e.target.checked)}
+                  >
+                    覆盖安装
+                  </Checkbox>
+                  <Tag color={d.status === 'downgrade' ? 'orange' : 'geekblue'}>
+                    {d.status === 'downgrade' ? '降级' : '升级'}
+                  </Tag>
+                  {label}
+                  <span style={{ color: '#888' }}>（当前 v{d.installedVersion}）</span>
+                  {d.requiredOverwrite && (
+                    <Tag color="red" style={{ marginLeft: 4 }}>当前版本不满足依赖要求，需覆盖</Tag>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
         </div>
       )}
       {(hasMissing || hasConflicts || hasCycles) && (

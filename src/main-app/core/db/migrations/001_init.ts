@@ -292,7 +292,9 @@ UPDATE workflows SET owner_plugin_id = NULL WHERE owner_plugin_id = 'com.fmb.hos
 
 -- 4) Hard-delete legacy "com.fmb.host" virtual plugin rows (if still present from migration 002).
 DELETE FROM plugin_versions WHERE plugin_id = 'com.fmb.host';
-DELETE FROM plugin_extensions WHERE plugin_id = 'com.fmb.host';
+-- plugin_extensions only exists on legacy DBs (pre extension_point_bindings rename);
+-- fresh schemas never create it, so DROP IF EXISTS doubles as the row cleanup there.
+DROP TABLE IF EXISTS plugin_extensions;
 DELETE FROM plugins WHERE id = 'com.fmb.host';
 
 PRAGMA foreign_keys = ON;

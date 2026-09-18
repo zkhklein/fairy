@@ -121,6 +121,23 @@ const DepCheckResultSchema = z.object({
   conflicts: z.array(DepCheckIssueSchema).default([]),
   cycles: z.array(z.array(z.string())).default([]),
 });
+/**
+ * A dependency plugin zip embedded under `bundled/` inside an app plugin zip.
+ * `status` compares the bundled version against the currently installed one:
+ *   new       → not installed yet, will be installed automatically
+ *   same      → same version already installed, skipped
+ *   upgrade   → a different (newer) version is bundled; user picks overwrite
+ *   downgrade → a different (older) version is bundled; user picks overwrite
+ */
+const BundledDepSchema = z.object({
+  depId: z.string().min(1),
+  version: z.string().min(1),
+  name: z.string().optional(),
+  installedVersion: z.string().optional(),
+  status: VersionStatusSchema,
+  /** true when the installed version does NOT satisfy the main plugin's semver range */
+  requiredOverwrite: z.boolean().default(false),
+});
 export const main_plugin_preInstallCheck = make({
   channel: 'main:plugin.preInstallCheck',
   params: z.object({ zipPath: z.string().min(1) }),
@@ -131,16 +148,24 @@ export const main_plugin_preInstallCheck = make({
     versionStatus: VersionStatusSchema.optional(),
     installedVersion: z.string().optional(),
     depCheck: DepCheckResultSchema,
+    bundledDeps: z.array(BundledDepSchema).default([]),
     errors: z.array(z.object({ code: z.string().optional(), message: z.string(), detail: z.unknown().optional() })).default([]),
   }),
 });
 
 // ---------- Batch install ----------
+const InstalledDepSchema = z.object({
+  pluginId: z.string().min(1),
+  version: z.string().min(1),
+  action: z.enum(['installed', 'overwritten', 'skipped']),
+});
 export const main_plugin_installBatch = make({
   channel: 'main:plugin.installBatch',
   params: z.object({
     zipPaths: z.array(z.string().min(1)).min(1),
     autoEnable: z.boolean().default(false),
+    /** Dependency plugin ids (from precheck bundledDeps) the user chose to overwrite. */
+    overwriteDeps: z.array(z.string().min(1)).default([]),
   }),
   result: z.object({
     results: z.array(z.object({
@@ -149,6 +174,7 @@ export const main_plugin_installBatch = make({
       pluginId: z.string().min(2).optional(),
       version: z.string().optional(),
       autoEnabled: z.boolean().default(false),
+      installedDeps: z.array(InstalledDepSchema).default([]),
       errors: z.array(z.object({ code: z.string().optional(), message: z.string(), detail: z.unknown().optional() })).default([]),
     })),
   }),

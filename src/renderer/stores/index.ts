@@ -48,7 +48,7 @@ interface PluginState extends FetchState {
   listVersions: (id: string) => Promise<void>;
   switchVersion: (id: string, version: string) => Promise<void>;
   preInstallBatch: (zipPaths: string[]) => Promise<void>;
-  installBatch: (args: { zipPaths: string[]; autoEnable?: boolean }) => Promise<void>;
+  installBatch: (args: { zipPaths: string[]; autoEnable?: boolean; overwriteDeps?: string[] }) => Promise<void>;
   loadScheduleTemplates: () => Promise<void>;
 }
 export const usePluginStore = create<PluginState>((set, get) => ({
@@ -102,10 +102,10 @@ export const usePluginStore = create<PluginState>((set, get) => ({
       });
     }
   },
-  installBatch: async ({ zipPaths, autoEnable = false }) => {
+  installBatch: async ({ zipPaths, autoEnable = false, overwriteDeps = [] }) => {
     set({ batchLoading: true, batchResults: null });
     try {
-      const r = await fmbApi.pluginInstallBatch({ zipPaths, autoEnable });
+      const r = await fmbApi.pluginInstallBatch({ zipPaths, autoEnable, overwriteDeps });
       set({ batchLoading: false, batchResults: r.results });
       void get().list(); // refresh table
     } catch (e) {

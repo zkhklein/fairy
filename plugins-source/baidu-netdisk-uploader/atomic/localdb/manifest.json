@@ -1,0 +1,10 @@
+{
+  "id": "com.fmb.tools.localdb",
+  "name": "Local DB (KV-backed)",
+  "version": "0.1.0",
+  "type": "atomic",
+  "description": "Document-style local database backed by host KV store. Provides collection CRUD (insert/find/findOne/update/remove/count) so app plugins can persist structured records without native SQLite access.",
+  "permissions": ["kv:read", "kv:write", "log:write"],
+  "dependencies": {},
+  "main": "main.js"
+}

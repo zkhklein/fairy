@@ -1,0 +1,10 @@
+{
+  "id": "com.fmb.baidunetdisk.client",
+  "name": "Baidu Netdisk Client",
+  "version": "0.2.7",
+  "type": "atomic",
+  "description": "Uploads local 7z split-volume files to Baidu Netdisk via OAuth 2.0 (AppKey/SecretKey). Exchanges an authorization code for access_token + refresh_token, auto-refreshes expired tokens. Upload runs via an inline Node.js script (node -e).",
+  "permissions": ["system:process:start", "system:process:read", "log:write", "kv:read", "kv:write", "secrets:read"],
+  "dependencies": {},
+  "main": "main.js"
+}

@@ -214,6 +214,48 @@ node out/cli/index.js plugin install plugins-dist/com.fmb.demo.echo2@0.1.0.zip
 - shared：`<领域>/index.ts` 单文件
 - 脚本：`scripts/<verb>-<noun>.[mt]s`；验收脚本统一 `scripts/verify_task<NN>.cjs`（CJS 零依赖，`node scripts/...` 直接跑）
 
+### 4.8 工作流（Workflow）定义规范
+
+**工作流是 App 插件的内置资产，不是用户手动创建的。**
+
+核心原则：
+- **工作流 = App 插件的业务流程定义**，在插件 `activate()` 时通过 `hostApi.workflows.create()` 注册，随插件生命周期存在
+- **工作流不可手动新增/删除/编辑**（UI 上不提供这些操作），只能由所属 App 插件管理
+- **工作流可被定时任务触发**（通过 `scheduleTemplates` 声明），**也可被手动触发**（工作流页"运行"按钮）
+- **App 插件必须为其核心业务流程声明工作流**，不能只在内部用 `plugins.invoke` 编排而不注册工作流
+
+工作流与定时任务的关系：
+- **工作流**定义"做什么"（DAG 节点编排：压缩→上传→清理）
+- **定时任务**定义"什么时候做"（cron / 一次性触发）
+- App 插件在 `manifest.json` 的 `scheduleTemplates[]` 中声明可被用户添加的定时任务模板，每个模板指定 `targetWorkflowId` 关联到具体工作流
+
+示例：百度上传插件的正确结构
+```
+App 插件 com.fmb.baidunetdisk.uploader
+├─ manifest.json
+│  ├─ scheduleTemplates[]     ← 声明用户可添加的定时任务模板
+│  │   ├─ { id:"scheduled_upload", label:"定时上传", targetWorkflowId:"wf-baidu-upload-flow", paramsSchema:{...} }
+│  │   └─ { id:"auto_resume",      label:"自动恢复", targetWorkflowId:"wf-baidu-uploader-auto-resume" }
+│  └─ extensionPoints[]       ← 注册模板处理器
+│      ├─ "schedule.template.com.fmb.baidunetdisk.uploader.scheduled_upload::onScheduledUpload"
+│      └─ "schedule.template.com.fmb.baidunetdisk.uploader.auto_resume::onAutoResume"
+│
+└─ main.ts activate()
+   ├─ workflows.create({ id:"wf-baidu-upload-flow", definition:{ nodes:[compress,upload,cleanup] } })
+   ├─ workflows.create({ id:"wf-baidu-uploader-auto-resume", ... })
+   └─ schedules.create({ ... })  ← 内部自用的默认定时任务（可选）
+```
+
+违反这条 = 工作流页面看不到插件的核心业务流程，定时任务页无法添加该插件的模板，用户无法手动触发或定时触发插件的核心功能。
+
+### 4.9 Windows 开发环境约定（pwsh + UTF-8 无 BOM + LF）
+
+本机在 Windows 上开发时统一：
+
+- **Shell 用 pwsh（PowerShell 7，路径 `C:\Program Files\PowerShell\7\pwsh.exe`）**，不要用 Windows PowerShell 5.1（`powershell.exe`）。老 5.1 的 `Set-Content -Encoding UTF8` 会写 BOM、参数编码行为也不同，历史上坑过 KV 文件解析。
+- **文本文件一律 UTF-8 无 BOM**（BOM 会让 `JSON.parse` 炸掉；写过文件后可用 `[System.IO.File]::ReadAllText($p)[0] -ne "`uFEFF"` 自查）。
+- **行尾 LF**：仓库已带 `.gitattributes`（`* text=lf eol=lf`，bat/cmd/ps1 例外仍 CRLF），且本仓库 git 配置 `core.autocrlf=false` + `core.eol=lf`。编辑器/IDE 保持 LF 保存，不要整文件转成 CRLF 造成全量 diff。
+
 ---
 
 ## 5. 调试故障时的快速定位表

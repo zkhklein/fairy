@@ -51,7 +51,7 @@ export interface HostApiServices {
    */
   onCreateWorkflow?: (args: { id?: string; name: string; description?: string; definition: Record<string, unknown>; vars?: Record<string, unknown>; owner_plugin_id?: string | null; }) => Promise<Record<string, unknown>>;
   onStartWorkflow?: (workflowId: string, input?: Record<string, unknown>) => Promise<{ runId: string; status: string }>;
-  onGetWorkflow?: (id: string) => Record<string, unknown> | null;
+  onGetWorkflow?: (id: string) => Promise<Record<string, unknown> | null>;
   /**
    * App-plugins can create schedules via Host.schedules.create(). The actual
    * scheduling is performed by SchedulerService (cron) so plugins can't

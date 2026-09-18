@@ -1,0 +1,10 @@
+{
+  "id": "com.fmb.tools.sevenzip",
+  "name": "7-Zip Compressor",
+  "version": "0.1.4",
+  "type": "atomic",
+  "description": "Spawns the local 7-Zip executable to create split, password-protected .7z archives, and to delete output folders. Uses hostApi.processes.start (detached) + processes.query polling for completion since the sandbox cannot capture child-process exit codes.",
+  "permissions": ["system:process:start", "system:process:read", "log:write", "kv:read", "kv:write"],
+  "dependencies": {},
+  "main": "main.js"
+}

@@ -277,7 +277,7 @@ console.log('\nTR-22.5 UI page contract: buttons renamed/added, Workflows has no
   check(143, 'Plugins install flow: dialogShowOpen (fmbApi) + installBatch wrapper (store) + PreCheckResult',
     plugins.includes('fmbApi.dialogShowOpen')
     && plugins.includes('const installBatch = usePluginStore')
-    && /installBatch\(\{\s*zipPaths:.*autoEnable\s*\}\)/.test(plugins)
+    && /installBatch\(\{\s*zipPaths:.*autoEnable/.test(plugins)
     && plugins.includes('MainPluginPreInstallCheckResult'));
 
   // Schedules page: store.loadScheduleTemplates → fmbApi.pluginListScheduleTemplates

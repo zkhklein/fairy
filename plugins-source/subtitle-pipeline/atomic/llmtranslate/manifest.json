@@ -1,7 +1,7 @@
 {
   "id": "com.fmb.subtitle.llmtranslate",
   "name": "LLM Subtitle Translator",
-  "version": "0.1.8",
+  "version": "0.2.4",
   "type": "atomic",
   "description": "Translates SRT to Chinese with a strict JSON {id,source,text} contract, original cue context, structural retries and optional reference-aware quality review. Source echo validates binding, not semantic accuracy. Automatic revisions remain pending review. API key is fetched at runtime via localhost invoke, never persisted.",
   "permissions": ["system:process:start", "system:process:read", "kv:read", "kv:write", "secrets:read", "secrets:write", "log:write"],

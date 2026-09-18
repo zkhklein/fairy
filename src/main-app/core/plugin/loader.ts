@@ -30,10 +30,31 @@ import { buildHostApi, type HostApiServices } from './host-api';
 const log = createLogger('plugin-loader');
 
 // ---------------- public types ----------------
+export interface InstalledDep {
+  pluginId: string;
+  version: string;
+  action: 'installed' | 'overwritten' | 'skipped';
+}
+export interface BundledDepInfo {
+  depId: string;
+  version: string;
+  name?: string;
+  installedVersion?: string;
+  status: 'new' | 'upgrade' | 'downgrade' | 'same';
+  /** true when the installed version does NOT satisfy the main plugin's semver range */
+  requiredOverwrite: boolean;
+}
+export interface InstallOptions {
+  /** Dependency plugin ids (bundled inside an app zip) the user chose to overwrite. */
+  overwriteDeps?: string[];
+  /** Internal: force current_version promotion even on downgrade (explicit overwrite). */
+  forcePromote?: boolean;
+}
 export interface InstallResult {
   ok: boolean;
   pluginId?: string;
   version?: string;
+  installedDeps?: InstalledDep[];
   error?: ProblemDetails & { cleanup?: string[] };
 }
 export interface EnableResult { ok: boolean; instanceId?: string; error?: ProblemDetails; }
@@ -227,29 +248,45 @@ export class PluginService {
             )
             .catch(() => {});
         } else {
-          // ── Already registered: sync manifest + promote current_version only,
+          // ── Already registered. Only sync manifest/permissions/dependencies
+          //    when this directory's version is current_version OR being
+          //    promoted to current_version. Old version dirs MUST NOT
+          //    overwrite manifest_json/permissions_json/dependencies_json —
+          //    otherwise a stale @0.1.9 dir alphabetically ordered after
+          //    @0.1.16 would silently revert permissions (e.g. drop
+          //    schedules:create) while current_version stays 0.1.16.
           //    NEVER touch status.
           const cur: string | undefined = existing.current_version;
           const promote =
             !cur ||
             (semver.valid(cur) && semver.valid(m.version) && semver.gt(m.version, cur));
-          this.raw()
-            .prepare(
-              `UPDATE plugins SET name=@name,type=@type,description=@desc,permissions_json=@perm,dependencies_json=@deps,manifest_json=@man,updated_at=@t` +
-                (promote ? `,current_version=@newver` : ``) +
-                ` WHERE id=@id`,
-            )
-            .run({
-              id: m.id,
-              name: m.name,
-              type: m.type,
-              desc: m.description || '',
-              perm,
-              deps,
-              man,
-              t: now,
-              newver: m.version,
-            });
+          const isCurrent = !promote && cur !== undefined && m.version === cur;
+          if (promote || isCurrent) {
+            this.raw()
+              .prepare(
+                `UPDATE plugins SET name=@name,type=@type,description=@desc,permissions_json=@perm,dependencies_json=@deps,manifest_json=@man,updated_at=@t` +
+                  (promote ? `,current_version=@newver` : ``) +
+                  ` WHERE id=@id`,
+              )
+              .run({
+                id: m.id,
+                name: m.name,
+                type: m.type,
+                desc: m.description || '',
+                perm,
+                deps,
+                man,
+                t: now,
+                newver: m.version,
+              });
+          } else {
+            // ── Old version dir (m.version < cur): keep manifest fields in
+            //    sync with current_version. Only bump updated_at so we know
+            //    the dir still exists on disk.
+            this.raw()
+              .prepare(`UPDATE plugins SET updated_at=@t WHERE id=@id`)
+              .run({ id: m.id, t: now });
+          }
         }
 
         // plugin_versions always track (INSERT OR IGNORE — PK = plugin_id+version).
@@ -285,6 +322,34 @@ export class PluginService {
       log.info({ newlyInstalled, newlyDisabled }, 'plugin rescan complete');
     }
     return { newlyInstalled, newlyDisabled };
+  }
+
+  /**
+   * Load all plugins whose DB status is 'enabled' into running sandboxes.
+   * Called once at boot (after workflow/schedule callbacks are wired) so that
+   * plugins the user enabled in a previous session are active again without
+   * requiring a manual disable→enable cycle. Failures are logged but do not
+   * abort boot.
+   */
+  async loadEnabledAtBoot(): Promise<{ loaded: number; failed: Array<{ id: string; error: string }> }> {
+    const rows = this.raw()
+      .prepare(`SELECT id, current_version FROM plugins WHERE status = 'enabled'`)
+      .all() as Array<{ id: string; current_version: string }>;
+    const failed: Array<{ id: string; error: string }> = [];
+    let loaded = 0;
+    for (const row of rows) {
+      try {
+        const r = await this.enablePlugin(row.id);
+        if (r.ok) loaded++;
+        else failed.push({ id: row.id, error: r.error?.detail ?? 'enable failed' });
+      } catch (e: any) {
+        failed.push({ id: row.id, error: e?.message ?? String(e) });
+      }
+    }
+    if (loaded > 0 || failed.length > 0) {
+      log.info({ loaded, failed: failed.length }, 'loadEnabledAtBoot complete');
+    }
+    return { loaded, failed };
   }
 
   /**
@@ -350,6 +415,60 @@ export class PluginService {
 
   get root(): string { return this.pluginsRoot; }
 
+  /**
+   * Version-independent per-plugin store file (KV / secrets).
+   *
+   * Layout: `<pluginsRoot>/.kv/<id>.json` and `<pluginsRoot>/.secrets/<id>.json`.
+   * Store files belong to the PLUGIN, not to one version — previously they lived
+   * inside `<id>@<version>/`, so every version switch silently stranded the
+   * plugin's saved config (baidu uploader lost its AppKey on upgrade this way).
+   *
+   * Legacy migration: on first access, if the new file is missing, all legacy
+   * per-version stores (`.fmb-kv.json` / `.fmb-secrets.json` in installed
+   * version dirs) are merged into it, oldest first so the freshest keys win.
+   */
+  private pluginStoreFile(pluginId: string, currentVersionDir: string, kind: 'kv' | 'secrets'): string {
+    const dir = path.join(this.pluginsRoot, kind === 'kv' ? '.kv' : '.secrets');
+    const target = path.join(dir, `${pluginId}.json`);
+    if (!fs.existsSync(target)) {
+      const legacyName = kind === 'kv' ? '.fmb-kv.json' : '.fmb-secrets.json';
+      try {
+        const dirs: string[] = [currentVersionDir];
+        for (const v of this.listVersions(pluginId)) {
+          if (v.directory && !dirs.includes(v.directory)) dirs.push(v.directory);
+        }
+        // Oldest installs first so the freshest keys win on merge. Merging (not
+        // copying) matters: a newer version dir may hold a partial store (e.g.
+        // runtime flags) while an older one carries the user's saved config.
+        const ordered = this.listVersions(pluginId)
+          .slice()
+          .sort((a, b) => (a.installed_at || 0) - (b.installed_at || 0))
+          .map((v) => v.directory as string)
+          .filter(Boolean);
+        const search = [...ordered, ...dirs.filter((d) => !ordered.includes(d))];
+        const merged: Record<string, unknown> = {};
+        let found = false;
+        for (const d of search) {
+          const legacy = path.join(d, legacyName);
+          if (!fs.existsSync(legacy)) continue;
+          try {
+            const raw = fs.readFileSync(legacy, 'utf8').replace(/^﻿/, '');
+            Object.assign(merged, JSON.parse(raw));
+            found = true;
+          } catch { /* skip unreadable legacy file */ }
+        }
+        if (found) {
+          fs.mkdirSync(dir, { recursive: true });
+          fs.writeFileSync(target, JSON.stringify(merged, null, 2), 'utf8');
+          log.info({ pluginId, to: target, kind }, 'migrated per-version store to version-independent file');
+        }
+      } catch (e: any) {
+        log.warn({ err: String(e?.message ?? e), pluginId, kind }, 'pluginStoreFile legacy migration failed');
+      }
+    }
+    return target;
+  }
+
   // ---------------- raw DB helpers (sync) ----------------
   private raw() { return getRawDb(); }
 
@@ -384,8 +503,68 @@ export class PluginService {
   // ---------------- Install ----------------
 
   /**
+   * Read the `bundled/*.zip` entries inside an extracted app-plugin directory.
+   * Each nested zip is a full installable plugin package; only its
+   * `manifest.json` entry is read (no extraction of the nested payload).
+   * Returns info for the install confirmation UI (which deps are new, which
+   * would overwrite an installed version) in a stable, deterministic order.
+   */
+  private readBundledDeps(extractedDir: string, mainManifest: PluginManifest): BundledDepInfo[] {
+    const bundledDir = path.join(extractedDir, 'bundled');
+    if (!fs.existsSync(bundledDir)) return [];
+    let files: string[] = [];
+    try {
+      files = fs.readdirSync(bundledDir).filter((f) => f.toLowerCase().endsWith('.zip')).sort();
+    } catch { return []; }
+    const declaredRanges = (mainManifest.dependencies ?? {}) as Record<string, string>;
+    const out: BundledDepInfo[] = [];
+    for (const f of files) {
+      try {
+        const zip = new AdmZip(path.join(bundledDir, f));
+        const entry = zip.getEntry('manifest.json');
+        if (!entry) continue;
+        const m = JSON.parse(entry.getData().toString('utf8').replace(/^﻿/, ''));
+        if (!m?.id || !m?.version) continue;
+        const existing = this.get(String(m.id));
+        const installedVersion: string | undefined = existing?.current_version;
+        let status: BundledDepInfo['status'] = 'new';
+        if (installedVersion) {
+          if (semver.valid(installedVersion) && semver.valid(String(m.version))) {
+            if (semver.eq(String(m.version), installedVersion)) status = 'same';
+            else if (semver.gt(String(m.version), installedVersion)) status = 'upgrade';
+            else status = 'downgrade';
+          } else {
+            status = String(m.version) === installedVersion ? 'same' : 'upgrade';
+          }
+        }
+        const range = declaredRanges[String(m.id)];
+        const requiredOverwrite =
+          !!installedVersion &&
+          status !== 'same' &&
+          !!range &&
+          !!semver.valid(installedVersion) &&
+          !semver.satisfies(installedVersion, range);
+        out.push({
+          depId: String(m.id),
+          version: String(m.version),
+          name: typeof m.name === 'string' ? m.name : undefined,
+          installedVersion,
+          status,
+          requiredOverwrite,
+        });
+      } catch (e: any) {
+        log.warn({ err: String(e?.message ?? e), file: f }, 'readBundledDeps: skipping unreadable bundled zip');
+      }
+    }
+    return out;
+  }
+
+  /**
    * Dry-run pre-install check: validates zip integrity + manifest schema +
    * version comparison vs. currently installed version + dependency check.
+   * App-plugin zips may embed their dependency closure under `bundled/*.zip`;
+   * those are surfaced via `bundledDeps` and make the corresponding declared
+   * dependencies satisfiable (they no longer count as missing/conflict).
    * Never writes DB nor filesystem beyond a tmp directory (cleaned up on exit).
    * Used by the UI install confirmation modal to show per-zip statuses before
    * committing to the actual install.
@@ -398,9 +577,11 @@ export class PluginService {
     versionStatus?: 'new' | 'upgrade' | 'downgrade' | 'same';
     installedVersion?: string;
     depCheck: DepCheckResult;
+    bundledDeps: BundledDepInfo[];
     errors: Array<{ code?: string; message: string; detail?: unknown }>;
   }> {
     const tmpDir = path.join(this.pluginsRoot, `.pre-${nanoid(8)}`);
+    const empty: BundledDepInfo[] = [];
     try {
       const errors: Array<{ code?: string; message: string; detail?: unknown }> = [];
       let manifest: PluginManifest | undefined;
@@ -411,12 +592,12 @@ export class PluginService {
         zip.extractAllTo(tmpDir, true);
       } catch (e: any) {
         errors.push({ code: 'zip.extract_failed', message: e?.message ?? 'Zip extract failed', detail: zipPath });
-        return { ok: false, depCheck: { ok: false, missing: [], conflicts: [], cycles: [] }, errors };
+        return { ok: false, depCheck: { ok: false, missing: [], conflicts: [], cycles: [] }, bundledDeps: empty, errors };
       }
       const parsed = readManifestFromDir(tmpDir, { instance: zipPath });
       if (!parsed.ok) {
         errors.push({ code: 'manifest.invalid', message: parsed.error?.detail ?? parsed.error?.title ?? 'Invalid manifest', detail: parsed.error });
-        return { ok: false, depCheck: { ok: false, missing: [], conflicts: [], cycles: [] }, errors };
+        return { ok: false, depCheck: { ok: false, missing: [], conflicts: [], cycles: [] }, bundledDeps: empty, errors };
       }
       manifest = parsed.manifest;
 
@@ -437,8 +618,23 @@ export class PluginService {
         }
       }
 
-      // 3. dependency check
+      // 2b. bundled dependency closure (app zips)
+      const bundledDeps = this.readBundledDeps(tmpDir, manifest);
+      const bundledSatisfies = new Map<string, string>();
+      for (const b of bundledDeps) bundledSatisfies.set(b.depId, b.version);
+
+      // 3. dependency check — bundled versions count as available
       const depCheck = this.parseDependencies(manifest.dependencies ?? {}, { forManifest: manifest });
+      const declared = manifest.dependencies ?? {};
+      depCheck.missing = depCheck.missing.filter((m) => {
+        const bv = bundledSatisfies.get(m.depId);
+        return !(bv && (!semver.valid(bv) || semver.satisfies(bv, declared[m.depId] ?? '*')));
+      });
+      depCheck.conflicts = depCheck.conflicts.filter((c) => {
+        const bv = bundledSatisfies.get(c.depId);
+        return !(bv && (!semver.valid(bv) || semver.satisfies(bv, declared[c.depId] ?? '*')));
+      });
+      depCheck.ok = depCheck.missing.length + depCheck.conflicts.length + depCheck.cycles.length === 0;
       for (const m of depCheck.missing) errors.push({ code: 'dep.missing', message: m.reason, detail: { depId: m.depId, requested: m.requested } });
       for (const c of depCheck.conflicts) errors.push({ code: 'dep.conflict', message: c.reason, detail: { depId: c.depId, requested: c.requested, installed: c.installed } });
       for (const cycle of depCheck.cycles) errors.push({ code: 'dep.cycle', message: `Dependency cycle: ${cycle.join(' → ')}`, detail: cycle });
@@ -449,6 +645,7 @@ export class PluginService {
         versionStatus,
         installedVersion,
         depCheck,
+        bundledDeps,
         errors,
       };
     } finally {
@@ -461,24 +658,32 @@ export class PluginService {
    * The caller can control auto-enable to avoid surprises (e.g. dependency
    * chains requiring deterministic enable order are handled by pre-install
    * checks rather than this method).
+   *
+   * App-plugin zips may embed dependency zips under `bundled/`. Those are
+   * installed (or skipped / overwritten per `overwriteDeps`) BEFORE the main
+   * plugin, and when `autoEnable` is on the bundled deps are enabled first so
+   * the app plugin's cross-plugin invoke works immediately.
    */
-  async installBatch(args: { zipPaths: string[]; autoEnable?: boolean }): Promise<{
+  async installBatch(args: { zipPaths: string[]; autoEnable?: boolean; overwriteDeps?: string[] }): Promise<{
     results: Array<{
       zipPath: string; ok: boolean; pluginId?: string; version?: string; autoEnabled?: boolean;
+      installedDeps: InstalledDep[];
       errors: Array<{ code?: string; message: string; detail?: unknown }>;
     }>;
   }> {
     type BatchResultItem = {
       zipPath: string; ok: boolean; pluginId?: string; version?: string; autoEnabled?: boolean;
+      installedDeps: InstalledDep[];
       errors: Array<{ code?: string; message: string; detail?: unknown }>;
     };
     const results: BatchResultItem[] = [];
     for (const zipPath of args.zipPaths) {
-      const installed = await this.installFromZip(zipPath);
+      const installed = await this.installFromZip(zipPath, { overwriteDeps: args.overwriteDeps ?? [] });
       if (!installed.ok) {
         results.push({
           zipPath,
           ok: false,
+          installedDeps: installed.installedDeps ?? [],
           errors: [{
             code: (installed.error as any)?.code,
             message: installed.error?.detail ?? installed.error?.title ?? 'Install failed',
@@ -489,6 +694,25 @@ export class PluginService {
       }
       let autoEnabled = false;
       const errors: BatchResultItem['errors'] = [];
+      const installedDeps = installed.installedDeps ?? [];
+      if (args.autoEnable) {
+        // Enable bundled deps first (install/overwrite/keep order preserved),
+        // so the main plugin's plugins.invoke targets are alive.
+        for (const dep of installedDeps) {
+          try {
+            const en = await this.enablePlugin(dep.pluginId);
+            if (!en.ok) {
+              errors.push({
+                code: 'dep_enable_failed',
+                message: `${dep.pluginId}: ${en.error?.detail ?? en.error?.title ?? 'Enable failed'}`,
+                detail: en.error,
+              });
+            }
+          } catch (e: any) {
+            errors.push({ code: 'dep_enable_failed', message: `${dep.pluginId}: ${e?.message ?? 'Enable failed'}`, detail: String(e) });
+          }
+        }
+      }
       if (args.autoEnable && installed.pluginId) {
         try {
           const en = await this.enablePlugin(installed.pluginId!);
@@ -511,13 +735,130 @@ export class PluginService {
         pluginId: installed.pluginId,
         version: installed.version,
         autoEnabled,
+        installedDeps,
         errors,
       });
     }
     return { results };
   }
 
-  async installFromZip(zipPath: string): Promise<InstallResult> {
+  /**
+   * Install the dependency zips bundled under `<extractedDir>/bundled/`.
+   * Order is topological (a bundled dep that itself depends on another bundled
+   * dep is installed after it). Decision per dep:
+   *   - not installed            → install
+   *   - same version installed   → skip
+   *   - different version + depId ∈ overwriteDeps → overwrite install
+   *     (forcePromote so an explicit downgrade also becomes current)
+   *   - different version + NOT chosen → keep existing IF it satisfies the
+   *     declared semver range, otherwise the whole install fails.
+   */
+  private async installBundledDeps(
+    extractedDir: string,
+    mainManifest: PluginManifest,
+    overwriteDeps: string[],
+    cleanupPaths: string[],
+  ): Promise<{ ok: boolean; installedDeps: InstalledDep[]; error?: ProblemDetails & { cleanup?: string[] } }> {
+    const bundledDir = path.join(extractedDir, 'bundled');
+    const installedDeps: InstalledDep[] = [];
+    if (!fs.existsSync(bundledDir)) return { ok: true, installedDeps };
+    const files = fs.readdirSync(bundledDir).filter((f) => f.toLowerCase().endsWith('.zip')).sort();
+    if (files.length === 0) return { ok: true, installedDeps };
+
+    // Read each bundled manifest (entry-only, no extraction).
+    const items: Array<{ zipPath: string; id: string; version: string; deps: string[] }> = [];
+    for (const f of files) {
+      const zipPath = path.join(bundledDir, f);
+      try {
+        const zip = new AdmZip(zipPath);
+        const entry = zip.getEntry('manifest.json');
+        if (!entry) continue;
+        const m = JSON.parse(entry.getData().toString('utf8').replace(/^﻿/, ''));
+        if (!m?.id || !m?.version) continue;
+        items.push({ zipPath, id: String(m.id), version: String(m.version), deps: Object.keys(m.dependencies ?? {}) });
+      } catch { /* unreadable bundled zips were already surfaced in precheck; skip */ }
+    }
+
+    // Topo-sort among bundled items (deps first). Cycle-safe: falls back to
+    // lexical order remainder (precheck's cycle detection covers the real graph).
+    const byId = new Map(items.map((it) => [it.id, it]));
+    const ordered: typeof items = [];
+    const done = new Set<string>();
+    const visiting = new Set<string>();
+    const visit = (it: (typeof items)[number]): void => {
+      if (done.has(it.id) || visiting.has(it.id)) return;
+      visiting.add(it.id);
+      for (const d of it.deps) {
+        const target = byId.get(d);
+        if (target) visit(target);
+      }
+      visiting.delete(it.id);
+      done.add(it.id);
+      ordered.push(it);
+    };
+    for (const it of items) visit(it);
+
+    const declared = (mainManifest.dependencies ?? {}) as Record<string, string>;
+    for (const it of ordered) {
+      const existing = this.get(it.id);
+      const installedVersion: string | undefined = existing?.current_version;
+      const range = declared[it.id] ?? '*';
+
+      if (installedVersion) {
+        const sameVer = semver.valid(installedVersion) && semver.valid(it.version)
+          ? semver.eq(it.version, installedVersion)
+          : it.version === installedVersion;
+        if (sameVer) {
+          installedDeps.push({ pluginId: it.id, version: installedVersion, action: 'skipped' });
+          continue;
+        }
+        if (!overwriteDeps.includes(it.id)) {
+          // User kept the existing installation — acceptable only if it
+          // satisfies the main plugin's declared range.
+          const satisfied = !semver.valid(installedVersion) || semver.satisfies(installedVersion, range);
+          if (satisfied) {
+            installedDeps.push({ pluginId: it.id, version: installedVersion, action: 'skipped' });
+            continue;
+          }
+          return {
+            ok: false,
+            installedDeps,
+            error: {
+              type: 'https://fmb.dev/problems/dependency-check-failed',
+              title: 'Dependency / Validation Failed',
+              status: 400,
+              detail: `依赖 ${it.id} 已安装 v${installedVersion}，不满足 ${range}；请在安装确认中勾选覆盖该依赖。`,
+              errors: [{ code: 'dep.conflict', message: `${it.id}@${range} required, installed ${installedVersion}, overwrite not selected` } as any],
+              cleanup: cleanupPaths,
+            },
+          };
+        }
+      }
+
+      const r = await this.installFromZip(it.zipPath, { forcePromote: overwriteDeps.includes(it.id) });
+      if (!r.ok) {
+        return {
+          ok: false,
+          installedDeps,
+          error: {
+            ...(r.error ?? {
+              type: 'https://fmb.dev/problems/dependency-check-failed',
+              title: 'Dependency install failed', status: 400, detail: `bundled dep ${it.id} install failed`, errors: [],
+            }),
+            cleanup: cleanupPaths,
+          },
+        };
+      }
+      installedDeps.push({
+        pluginId: it.id,
+        version: it.version,
+        action: installedVersion ? 'overwritten' : 'installed',
+      });
+    }
+    return { ok: true, installedDeps };
+  }
+
+  async installFromZip(zipPath: string, opts?: InstallOptions): Promise<InstallResult> {
     const tmpDir = path.join(this.pluginsRoot, `.tmp-${nanoid(8)}`);
     const cleanupPaths: string[] = [tmpDir];
     try {
@@ -567,10 +908,24 @@ export class PluginService {
         };
       }
 
+      // App-plugin zips may embed their dependency closure under bundled/.
+      // Install those FIRST (nested zip paths live inside tmpDir, which the
+      // rename below would otherwise move away).
+      const bundled = await this.installBundledDeps(tmpDir, manifest, opts?.overwriteDeps ?? [], cleanupPaths);
+      if (!bundled.ok) {
+        return { ok: false, installedDeps: bundled.installedDeps, error: bundled.error };
+      }
+
       const targetDir = path.join(this.pluginsRoot, `${manifest.id}@${manifest.version}`);
       cleanupPaths.push(targetDir);
       if (fs.existsSync(targetDir)) fs.rmSync(targetDir, { recursive: true, force: true });
       fs.renameSync(tmpDir, targetDir);
+      // Deps now live in their own plugin dirs; drop the embedded copies so the
+      // installed app directory stays lean.
+      const installedBundledDir = path.join(targetDir, 'bundled');
+      if (fs.existsSync(installedBundledDir)) {
+        try { fs.rmSync(installedBundledDir, { recursive: true, force: true }); } catch { /* noop */ }
+      }
 
       // T12-B: compile app plugin renderer to renderer.umd.js via esbuild (if available).
       if (manifest.type === 'app' && manifest.renderer) {
@@ -590,7 +945,7 @@ export class PluginService {
         });
       } else {
         const cur: string | undefined = existing.current_version;
-        const promote = !cur || (semver.valid(cur) && semver.valid(manifest.version) && semver.gt(manifest.version, cur));
+        const promote = !!opts?.forcePromote || !cur || (semver.valid(cur) && semver.valid(manifest.version) && semver.gt(manifest.version, cur));
         this.raw().prepare(`UPDATE plugins SET name=@name,type=@type,description=@desc,permissions_json=@perm,dependencies_json=@deps,manifest_json=@man,updated_at=@t` + (promote ? `,current_version=@newver` : ``) + ` WHERE id=@id`).run({
           id: manifest.id, name: manifest.name, type: manifest.type, desc: manifest.description || '',
           perm: permissionsJson, deps: depsJson, man: manifestJson, t: now, newver: manifest.version,
@@ -612,7 +967,7 @@ export class PluginService {
         pluginVersion: { plugin_id: manifest.id, version: manifest.version, directory: targetDir, installed_at: now },
       }, { source: 'plugin.service' }).catch(() => {});
 
-      return { ok: true, pluginId: manifest.id, version: manifest.version };
+      return { ok: true, pluginId: manifest.id, version: manifest.version, installedDeps: bundled.installedDeps };
     } catch (err) {
       for (const p of cleanupPaths) try { if (fs.existsSync(p)) fs.rmSync(p, { recursive: true, force: true }); } catch {}
       const pd = toProblemDetails(err, { status: 500, instance: zipPath });
@@ -717,8 +1072,18 @@ export class PluginService {
           }
         });
       }),
-      onStartWorkflow: (wfId, input) => Promise.resolve(this.workflowCallbacks.start?.(wfId, input) ?? { runId: '', status: 'pending' }),
-      onGetWorkflow: (wfId) => this.workflowCallbacks.get?.(wfId) ?? null,
+      onStartWorkflow: (wfId, input) => new Promise((resolve, reject) => {
+        process.nextTick(() => {
+          try { resolve(this.workflowCallbacks.start?.(wfId, input) ?? { runId: '', status: 'pending' }); }
+          catch (e: any) { reject(e instanceof Error ? e : new Error(String(e))); }
+        });
+      }),
+      onGetWorkflow: (wfId) => new Promise((resolve, reject) => {
+        process.nextTick(() => {
+          try { resolve(this.workflowCallbacks.get?.(wfId) ?? null); }
+          catch (e: any) { reject(e instanceof Error ? e : new Error(String(e))); }
+        });
+      }),
       onCreateSchedule: (a) => new Promise((resolve, reject) => {
         process.nextTick(() => {
           try {
@@ -757,20 +1122,21 @@ export class PluginService {
         } catch (err) { log.warn({ err: String(err) }, 'plugin onError insert failed'); }
       },
       onSecretGet: (key) => {
-        const f = path.join(pvRow.directory, '.fmb-secrets.json');
+        const f = this.pluginStoreFile(id, pvRow.directory, 'secrets');
         if (!fs.existsSync(f)) return null;
         try { return JSON.parse(fs.readFileSync(f, 'utf8'))[key] ?? null; } catch { return null; }
       },
       onSecretSet: (key, value) => {
-        const f = path.join(pvRow.directory, '.fmb-secrets.json');
+        const f = this.pluginStoreFile(id, pvRow.directory, 'secrets');
         const obj = fs.existsSync(f) ? JSON.parse(fs.readFileSync(f, 'utf8')) : {};
         obj[key] = value;
+        fs.mkdirSync(path.dirname(f), { recursive: true });
         fs.writeFileSync(f, JSON.stringify(obj, null, 2), { mode: 0o600 });
         return { id: 0, key, value, scope: 'plugin' };
       },
       onSecretDelete: () => true,
       onKvGet: (key, global) => {
-        const f = global ? path.join(this.pluginsRoot, '.fmb-kv-global.json') : path.join(pvRow.directory, '.fmb-kv.json');
+        const f = global ? path.join(this.pluginsRoot, '.fmb-kv-global.json') : this.pluginStoreFile(id, pvRow.directory, 'kv');
         if (!fs.existsSync(f)) return null;
         try {
           // Strip a leading UTF-8 BOM if present (PowerShell's Set-Content -Encoding UTF8
@@ -780,7 +1146,7 @@ export class PluginService {
         } catch { return null; }
       },
       onKvSet: (key, value, global) => {
-        const f = global ? path.join(this.pluginsRoot, '.fmb-kv-global.json') : path.join(pvRow.directory, '.fmb-kv.json');
+        const f = global ? path.join(this.pluginsRoot, '.fmb-kv-global.json') : this.pluginStoreFile(id, pvRow.directory, 'kv');
         let obj = {} as Record<string, unknown>;
         if (fs.existsSync(f)) {
           try {
@@ -791,11 +1157,12 @@ export class PluginService {
         obj[key] = value;
         // Write WITHOUT BOM (fs.writeFileSync with 'utf8' on Node never writes one;
         // explicitly enforce consistency so round-trips through PowerShell stay clean).
+        fs.mkdirSync(path.dirname(f), { recursive: true });
         fs.writeFileSync(f, JSON.stringify(obj, null, 2), 'utf8');
         return true;
       },
       onKvDelete: (key, global) => {
-        const f = global ? path.join(this.pluginsRoot, '.fmb-kv-global.json') : path.join(pvRow.directory, '.fmb-kv.json');
+        const f = global ? path.join(this.pluginsRoot, '.fmb-kv-global.json') : this.pluginStoreFile(id, pvRow.directory, 'kv');
         if (!fs.existsSync(f)) return true;
         let obj = {} as Record<string, unknown>;
         try {

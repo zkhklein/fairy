@@ -1,7 +1,9 @@
 /* global hostApi, __hostEnv */
 // @ts-nocheck
-import runnerSrc from './runner.js.txt';
-import srtSrc from '../../shared/srt.js.txt';
+/* runner.blob.txt = runner.js.txt + shared/srt.js.txt 组合后 gzip+base64（scripts/build-runner-blob.mjs 生成）。
+ * 命令行只放引导装载 + 有界 P 参数：node -e 直塞整段脚本会撞 Windows 32767 字符上限
+ * （2026-09-18 实测 34,944 字符 ENAMETOOLONG）。无上界的术语表由 runner 经 getRunConfig 自取。 */
+import runnerBlob from './runner.blob.txt';
 
 var DEFAULT_NODE = 'C:\\Program Files\\nodejs\\node.exe';
 
@@ -30,10 +32,16 @@ module.exports = {
     if (typeof payload.retainDiagnostics === 'boolean') await hostApi.kv.set('config:retainDiagnostics', String(payload.retainDiagnostics));
     if (typeof payload.glossary === 'string') await hostApi.kv.set('config:glossary', payload.glossary);
     if (Array.isArray(payload.glossaryPaths)) await hostApi.kv.set('config:glossaryPaths', JSON.stringify(payload.glossaryPaths.filter(function (p) { return typeof p === 'string' && p.trim(); })));
+    /* 并行度：每池（翻译池/复核池）1-6 路（默认 3），钳制到合法区间 */
+    if (payload.concurrency != null) {
+      var c = Math.round(Number(payload.concurrency));
+      if (Number.isFinite(c) && c >= 1) await hostApi.kv.set('config:concurrency', String(Math.min(6, c)));
+    }
     return { ok: true };
   },
 
   async getConfig() {
+    var conc = parseInt(String(await hostApi.kv.get('config:concurrency') || ''), 10);
     return {
       ok: true,
       nodePath: await hostApi.kv.get('config:nodePath') || '',
@@ -45,6 +53,7 @@ module.exports = {
       retainDiagnostics: (await hostApi.kv.get('config:retainDiagnostics')) === 'true',
       glossary: await hostApi.kv.get('config:glossary') || '',
       glossaryPaths: JSON.parse(await hostApi.kv.get('config:glossaryPaths') || '[]'),
+      concurrency: Number.isFinite(conc) && conc >= 1 ? Math.min(6, conc) : 3,
     };
   },
 
@@ -54,6 +63,14 @@ module.exports = {
     /* 契约是 {value}，但旧宿主实现直接返回裸字符串 —— 两种形状都兼容 */
     var v = s ? (typeof s === 'string' ? s : s.value) : null;
     return { key: v || null };
+  },
+
+  /* runner 经 localhost invoke 自取无上界配置（术语表粘贴文本不能进 node -e 命令行） */
+  async getRunConfig() {
+    return {
+      glossary: await hostApi.kv.get('config:glossary') || '',
+      glossaryPaths: JSON.parse(await hostApi.kv.get('config:glossaryPaths') || '[]'),
+    };
   },
 
   async storeResult(payload) {
@@ -77,25 +94,36 @@ module.exports = {
     if (!payload.srtPath) throw new Error('translateSrt: srtPath required');
     if (!payload.workDir) throw new Error('translateSrt: workDir required');
     await hostApi.kv.delete('translateResult:' + taskId);
-    await hostApi.kv.delete('llmProgress:' + taskId);
+    /*
+     * 重启收养（2026-09-18 实测事故：应用重启 → detached runner 存活继续烧钱 + studio 重排任务
+     * → 新旧两个 runner 双跑双计费）。心跳新鲜 = 有存活 runner 在推进本任务：不重复拉起，
+     * 直接沿用其结果；心跳过期（停滞/已死）才 spawn 新 runner。
+     * 旧版 runner 心跳只在调用边界落（间隔可达 ~5 分钟），故阈值取 5 分钟；新版 runner 每 30s 心跳全覆盖。
+     */
+    var beat = parseInt(String(await hostApi.kv.get('llmProgress:' + taskId) || ''), 10) || 0;
+    var adopt = beat > 0 && (Date.now() - beat) < 5 * 60 * 1000;
+    if (!adopt) {
+      await hostApi.kv.delete('llmProgress:' + taskId);
 
-    var glossaryPaths = [];
-    try { glossaryPaths = JSON.parse(await hostApi.kv.get('config:glossaryPaths') || '[]'); } catch (_) {}
+    var concRaw = parseInt(String(await hostApi.kv.get('config:concurrency') || ''), 10);
     var params = {
       taskId: taskId, srtPath: payload.srtPath, sourceLang: payload.sourceLang || '', workDir: payload.workDir,
       fmbDataDir: _dataRoot(), callbackPluginId: 'com.fmb.subtitle.llmtranslate', studioPluginId: 'com.fmb.subtitle.studio',
       apiBase: await hostApi.kv.get('config:apiBase') || '', model: await hostApi.kv.get('config:model') || '',
-      glossary: await hostApi.kv.get('config:glossary') || '', glossaryPaths: glossaryPaths,
       semanticReview: (await hostApi.kv.get('config:semanticReview')) === 'true',
       retainDiagnostics: (await hostApi.kv.get('config:retainDiagnostics')) === 'true',
+      concurrency: Number.isFinite(concRaw) && concRaw >= 1 ? Math.min(6, concRaw) : 3,
     };
-    var script = runnerSrc.replace('/*__FMB_SRT__*/', function () { return srtSrc; }).replace('/*__FMB_PARAMS__*/', function () { return 'var P = ' + JSON.stringify(params) + ';'; });
+    /* 引导装载：P 注入作用域，脚本本体从 gzip blob 解出（命令行 ~13KB 且与 runner 源码规模脱钩） */
+    var boot = 'var P = ' + JSON.stringify(params) + ';eval(require("zlib").gunzipSync(Buffer.from("' + runnerBlob + '","base64")).toString("utf8"))';
 
-    await hostApi.processes.start({ executablePath: await _nodePath(), args: ['-e', script], detached: true, timeoutMs: 10000 });
+    await hostApi.processes.start({ executablePath: await _nodePath(), args: ['-e', boot], detached: true, timeoutMs: 10000 });
+    }
+    /* 收养路径：不 spawn，轮询沿用存活 runner 落盘的 translateResult */
 
     var hardDeadline = Date.now() + 2 * 60 * 60 * 1000;
     var stallMs = 10 * 60 * 1000;
-    var lastBeat = Date.now();
+    var lastBeat = adopt ? beat : Date.now();
     while (Date.now() < hardDeadline) {
       var raw = await hostApi.kv.get('translateResult:' + taskId);
       if (raw) {
@@ -103,8 +131,8 @@ module.exports = {
         if (!r.ok) throw new Error('llmtranslate: ' + (r.error || 'unknown'));
         return { ok: true, translatedSrtPath: r.translatedSrtPath, lineCount: r.lineCount, chunks: r.chunks, usage: r.usage, reviewPath: r.reviewPath || '' };
       }
-      var beat = await hostApi.kv.get('llmProgress:' + taskId);
-      if (beat) lastBeat = Math.max(lastBeat, parseInt(beat, 10) || lastBeat);
+      var beat2 = await hostApi.kv.get('llmProgress:' + taskId);
+      if (beat2) lastBeat = Math.max(lastBeat, parseInt(beat2, 10) || lastBeat);
       if (Date.now() - lastBeat > stallMs) throw new Error('llmtranslate: 10 分钟无进度，判定停滞');
       await new Promise(function (rs) { setTimeout(rs, 2000); });
     }

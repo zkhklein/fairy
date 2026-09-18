@@ -216,12 +216,13 @@ export function registerIpcHandlers(ctx: IpcRegistry): () => void {
       versionStatus: r.versionStatus,
       installedVersion: r.installedVersion,
       depCheck: r.depCheck,
+      bundledDeps: r.bundledDeps,
       errors: r.errors,
     };
   });
   // Batch install + optional auto-enable. Results returned per zip,
   // individual failures never abort the remaining batch.
-  wire(main_plugin_installBatch, async (p) => pluginSvc.installBatch({ zipPaths: p.zipPaths, autoEnable: !!p.autoEnable }));
+  wire(main_plugin_installBatch, async (p) => pluginSvc.installBatch({ zipPaths: p.zipPaths, autoEnable: !!p.autoEnable, overwriteDeps: p.overwriteDeps ?? [] }));
   // Enabled app plugins that declare at least one scheduleTemplate.
   wire(main_plugin_listScheduleTemplates, () => {
     const rows = db.prepare(`

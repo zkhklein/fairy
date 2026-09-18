@@ -98,8 +98,16 @@ scripts/build-*.log
 # Temp scratch files
 .tdd-*.txt
 .tmp_*
+.tmp-*
+.tmp-plugins-backup-*/
 _e2e_final.js
 .asar-unpacked/
+
+# One-shot DB fix / debug scripts (never commit)
+_check_status.py
+_test_listdir.js
+_tmp_query.cjs
+install-codex-skills-global.ps1
 
 # Trae spec/plan documents (local planning, not source)
 .trae/
