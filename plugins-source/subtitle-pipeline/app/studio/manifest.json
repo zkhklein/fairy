@@ -1,13 +1,14 @@
 {
   "id": "com.fmb.subtitle.studio",
   "name": "字幕工坊",
-  "version": "0.1.8",
+  "version": "0.1.11",
   "type": "app",
   "description": "选择外语视频/音频 → Whisper 提取字幕 → LLM 翻译成中文 → 在媒体同目录生成 <文件名>.zh.srt（PotPlayer 自动加载）。任务串行执行，支持失败重试与断点续跑。",
   "permissions": [
     "log:write", "audit:write", "kv:read", "kv:write",
     "plugins:read", "plugins:invoke",
     "workflows:create", "workflows:read", "workflows:execute",
+    "schedules:create", "schedules:write", "schedules:read",
     "secrets:read", "secrets:write",
     "system:process:start", "system:process:read"
   ],

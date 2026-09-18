@@ -2,6 +2,7 @@
 // @ts-nocheck
 
 var WF_BASE = 'wf-subtitle-flow';
+var WF_RESUME_ID = 'wf-subtitle-studio-auto-resume';
 var RECOVERABLE_RE = /timed out|停滞|timeout|HTTP 5\d\d|429|ECONNRESET|socket|network|网络/i;
 var _wfId = null; /* 当前生效的工作流 id（definition 演进时换新版本 id，HostApi 无 workflow update） */
 var TASKS_KEY = 'tasks';
@@ -51,7 +52,9 @@ async function _ensureWorkflow() {
     var id = v === 1 ? WF_BASE : WF_BASE + '-v' + v;
     var wf = null;
     try { wf = await hostApi.workflows.get(id); } catch (_) { wf = null; }
-    if (!wf) break;
+    /* 版本可能不连续（低版本残留被清理后）：continue 查更高版本，不能 break——
+     * 否则 v1 缺失会无视已存在的 v2 并重建 v1，制造重复（canan 期间实测发生过） */
+    if (!wf) continue;
     var same = false;
     try { same = JSON.stringify(wf.definition) === defJson; } catch (_) {}
     if (same) { _wfId = id; return; }
@@ -69,12 +72,31 @@ async function _ensureWorkflow() {
 }
 
 /*
- * 自动恢复守护（参考百度上传-自动恢复）：内部 3 分钟 setInterval。
- * 项目约定 app 插件用 sandbox 内定时器做周期任务，不走 host schedules/workflows
- * （HTTP enable 路径的 schedules.create 不可靠——百度 uploader 同样 fallback 内部 timer）。
- * onAutoResume 保持导出：可经 HTTP invoke 手动触发与离线测试。
+ * 自动恢复（参考百度上传-自动恢复）。主路径 = 专用工作流 + 3 分钟 cron 定时任务（定时任务页可见）；
+ * schedule 创建失败时 fallback 内部 setInterval 保持功能可用。
+ * 注：0.1.6-0.1.9 期间 schedule 曾无声失败——根因是 manifest 漏声明 schedules:create 权限
+ * （权限拒绝记录在错误日历 plugin:*.permission），0.1.10 已补齐。
  */
 async function _ensureAutoResume() {
+  var def = {
+    nodes: [{ id: 'resume', type: 'atomic', pluginId: 'com.fmb.subtitle.studio', action: 'onAutoResume', inputs: {} }],
+    edges: [], entryNode: 'resume', vars: {},
+  };
+  try {
+    var wfExisting = null;
+    try { wfExisting = await hostApi.workflows.get(WF_RESUME_ID); } catch (_) { wfExisting = null; }
+    if (!wfExisting) await hostApi.workflows.create({ id: WF_RESUME_ID, name: '字幕工坊-自动恢复', description: '周期扫描可恢复中止任务并重新排队', definition: def });
+    try {
+      await hostApi.schedules.create({ id: 'sched-subtitle-studio-auto-resume', name: '字幕工坊-自动恢复(3分钟)', cron: '*/3 * * * *', workflowId: WF_RESUME_ID, enabled: true });
+      hostApi.logger.info('studio: auto-resume schedule created', {});
+    } catch (se) {
+      /* UNIQUE = 定时任务已存在（重复激活），schedule 模式已生效，无需 fallback */
+      if (!/UNIQUE|already|exist/i.test(String(se && se.message))) throw se;
+    }
+    return; /* schedule 模式生效 */
+  } catch (e) {
+    hostApi.logger.warn('studio: auto-resume schedule unavailable, falling back to internal timer', { error: e && e.message });
+  }
   if (_resumeTimer) clearInterval(_resumeTimer);
   _resumeTimer = setInterval(function () {
     Promise.resolve(module.exports.onAutoResume()).catch(function (e) {
