@@ -170,6 +170,7 @@ module.exports = {
     }
     t.reviewPath = ''; t.sourceLang = ''; t.model = ''; t.finalPath = '';
     t.timelineWarnings = [];
+    t.autoRetries = 0; /* 手动重试 = 用户意志，重新授予 3 次自动恢复额度 */
     t.status = 'queued'; t.error = ''; t.progressText = '排队重试'; t.finishedAt = 0;
     await _saveTasks(tasks);
     return { ok: true };
@@ -219,7 +220,7 @@ module.exports = {
 
   /* ---- 自动恢复（参考百度上传-自动恢复）：由 3 分钟 cron 工作流周期调用 ---- */
   async onAutoResume() {
-    var recovered = 0, unstuck = false;
+    var recovered = 0, unstuck = false, orphans = 0;
     /* 队列解堵守护：串行执行卡死超过 2 小时（远超单任务常规波动）强制放行，防全队列冻结 */
     if (_running && _runningSince && Date.now() - _runningSince > 2 * 60 * 60 * 1000) {
       _running = false; _runningSince = 0; unstuck = true;
@@ -227,8 +228,17 @@ module.exports = {
     }
     var tasks = await _loadTasks();
     tasks.forEach(function (t) {
-      if ((t.autoRetries || 0) >= 3) return;
       var midState = t.status === 'asr' || t.status === 'translating' || t.status === 'writing';
+      /* 孤儿中间态收尾：队列空闲但自动恢复额度已用尽（canan FC 实测：卡 translating 一天无人收尾） */
+      if (midState && !_running && (t.autoRetries || 0) >= 3) {
+        t.status = 'failed';
+        t.progressText = '自动恢复额度已用尽';
+        if (!t.error) t.error = '多次自动恢复后仍未完成';
+        t.finishedAt = t.finishedAt || Date.now();
+        orphans++;
+        return;
+      }
+      if ((t.autoRetries || 0) >= 3) return;
       /* 中间态恢复仅在队列空闲时执行（避免与正在执行的任务并发重跑 whisper） */
       if (midState && _running) return;
       var recoverableFailed = t.status === 'failed' && RECOVERABLE_RE.test(t.error || '');
@@ -239,8 +249,8 @@ module.exports = {
       t.error = '';
       recovered++;
     });
-    if (recovered) await _saveTasks(tasks);
-    return { ok: true, recovered: recovered, unstuck: unstuck };
+    if (recovered || orphans) await _saveTasks(tasks);
+    return { ok: true, recovered: recovered, unstuck: unstuck, orphans: orphans };
   },
 
   /* ---- runner 回调 ---- */

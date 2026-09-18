@@ -57,3 +57,15 @@ test('auto-resume recovers idle mid-state and transient failures, respects cap a
   assert.equal(tasks.auth.status, 'failed'); /* 鉴权类错误不自动重试 */
   assert.equal(tasks.capped.status, 'failed'); /* 达 3 次上限不再自动 */
 });
+test('orphaned mid-state with exhausted retries is finalized as failed; manual retry resets budget', async () => {
+  const { api, kv } = plugin('app/studio', { tasks: JSON.stringify([
+    { taskId: 'orphan', status: 'translating', autoRetries: 3, error: '块 102/135 翻译失败: 编号 2037 的 source 与原稿不符' },
+  ]) });
+  const r = await api.onAutoResume();
+  assert.equal(r.orphans, 1); assert.equal(r.recovered, 0);
+  let task = JSON.parse(kv.get('tasks'))[0];
+  assert.equal(task.status, 'failed'); assert.ok(task.error.includes('2037'));
+  await api.retryTask({ taskId: 'orphan' });
+  task = JSON.parse(kv.get('tasks'))[0];
+  assert.equal(task.status, 'queued'); assert.equal(task.autoRetries, 0);
+});

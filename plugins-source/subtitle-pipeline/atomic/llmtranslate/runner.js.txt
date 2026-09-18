@@ -91,7 +91,9 @@
       if (typeof row.id !== 'number' || !Number.isSafeInteger(row.id)) throw new Error('编号必须为整数');
       if (!(row.id in expected)) throw new Error('输出含额外编号 ' + row.id);
       if (row.id in result) throw new Error('输出含重复编号 ' + row.id);
-      if (row.source !== expected[row.id]) throw new Error('编号 ' + row.id + ' 的 source 与原稿不符');
+      /* 严格比对失败再走规范化比对（模型复写 source 常见无害变形：空白/全角空格/零宽字符——
+       * canan FC 实测：编号 2037 因此类差异逐字比对误杀且二分到单行无法恢复） */
+      if (row.source !== expected[row.id] && normSource(row.source) !== normSource(expected[row.id])) throw new Error('编号 ' + row.id + ' 的 source 与原稿不符');
       if (typeof row.text !== 'string') throw new Error('编号 ' + row.id + ' 的译文不是字符串');
       var text = row.text.replace(/\r\n?/g, '\n').trim();
       if (!text || /\n[ \t]*\n/.test(text) || text.indexOf('-->') >= 0 || text.indexOf('\x00') >= 0) throw new Error('编号 ' + row.id + ' 的译文为空或包含破坏 SRT 的格式');
@@ -99,6 +101,9 @@
     });
     cues.forEach(function (c) { if (!(c.id in result)) throw new Error('译文缺少编号 ' + c.id); });
     return result;
+  }
+  function normSource(s) {
+    return String(s).replace(/\s+/g, '').replace(/[\u200b\ufeff\u200e\u200f\u00a0]/g, '');
   }
   function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
   function fatal(msg) { var e = new Error(msg); e.fatal = true; return e; }
@@ -215,6 +220,8 @@
         for (var i = from; i < to && i < entries.length; i++) out.push({ id: entries[i].id, source: origTexts[i] });
         return out;
       }
+      /* 二分子块断点兜底：主块 key 未命中（上轮靠二分完成）时子块可整段命中，避免契约重试白跑 */
+      if (applyDone(offset, count)) return entries.slice(offset, offset + count).map(function (e) { return e.text; });
       var cues = ctxSlice(offset, offset + count);
       var payload = {
         reference: glossary,
@@ -240,7 +247,15 @@
         } catch (e) { diagnostic('rejected', { offset: offset, count: count, attempt: attempt, error: e.message }); if (e.fatal) throw e; lastErr = e; }
         await postInvoke(meta, P.callbackPluginId, 'storeProgress', { taskId: P.taskId, ts: Date.now() });
       }
-      if (translated) return translated;
+      if (translated) {
+        /* 块级断点（含二分子块）：每块完成即落盘，重跑时跳过已完成块（canan FC 实测：135 块全量重翻 3 次烧掉数小时） */
+        try {
+          var rec = { key: entries[offset].id + '-' + entries[offset + count - 1].id, texts: {} };
+          cues.forEach(function (c, i2) { rec.texts[c.id] = translated[i2]; });
+          fs.appendFileSync(progressPath, JSON.stringify(rec) + '\n', 'utf8');
+        } catch (_) {}
+        return translated;
+      }
       if (count <= 1 || depth >= 6) throw fatal('块 ' + (ci + 1) + '/' + chunks.length + ' 翻译失败: ' + (lastErr && lastErr.message));
       console.error('split retry: block ' + (ci + 1) + ' lines ' + (offset + 1) + '-' + (offset + count) + ' depth ' + depth + ' (' + (lastErr && lastErr.message) + ')');
       var mid = Math.floor(count / 2);
@@ -249,9 +264,35 @@
       var b = await translateRange(offset + mid, count - mid, ci, depth + 1, tokenBox);
       return a.concat(b);
     }
+    /* 断点续跑：raw.srt 复用使 chunking 确定性一致，块 key = (首id,尾id) */
+    var progressPath = path.join(P.workDir, 'translate-progress.ndjson');
+    var doneRanges = {};
+    try {
+      fs.readFileSync(progressPath, 'utf8').split(/\r?\n/).forEach(function (line) {
+        if (!line.trim()) return;
+        try { var rec = JSON.parse(line); if (rec && rec.key && rec.texts) doneRanges[rec.key] = rec.texts; } catch (_) {}
+      });
+    } catch (_) {}
+    function applyDone(offset, count) {
+      var key = entries[offset].id + '-' + entries[offset + count - 1].id;
+      if (!(key in doneRanges)) return false;
+      for (var i = 0; i < count; i++) {
+        var txt = doneRanges[key][entries[offset + i].id];
+        if (typeof txt !== 'string') return false;
+        entries[offset + i].text = txt;
+        report.entries[offset + i].translation = txt;
+      }
+      return true;
+    }
     var tokenBox = { total: 0 };
     for (var ci = 0; ci < chunks.length; ci++) {
       var chunk = chunks[ci], offset = entries.indexOf(chunk[0]);
+      if (applyDone(offset, chunk.length)) {
+        saveReport();
+        await postInvoke(meta, P.studioPluginId, 'storeProgress', { taskId: P.taskId, stage: 'translating', text: '翻译中 · 块 ' + (ci + 1) + '/' + chunks.length + '（断点续跑）' });
+        await postInvoke(meta, P.callbackPluginId, 'storeProgress', { taskId: P.taskId, ts: Date.now() });
+        continue;
+      }
       var translated = await translateRange(offset, chunk.length, ci, 0, tokenBox);
       for (var k2 = 0; k2 < chunk.length; k2++) { chunk[k2].text = translated[k2]; report.entries[offset + k2].translation = translated[k2]; }
       saveReport();

@@ -1,7 +1,7 @@
 {
   "id": "com.fmb.subtitle.llmtranslate",
   "name": "LLM Subtitle Translator",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "type": "atomic",
   "description": "Translates SRT entries to Chinese via DeepInfra (Qwen2.5-72B-Instruct) using a JSON {id,source,text} contract synced from SUCCUBUSQ subtitles.py: verbatim source echo catches content misalignment; strict SRT parsing, structural retries with assistant feedback, binary split fallback, optional glossary + semantic review. API key is fetched at runtime via localhost invoke, never persisted.",
   "permissions": ["system:process:start", "system:process:read", "kv:read", "kv:write", "secrets:read", "secrets:write", "log:write"],

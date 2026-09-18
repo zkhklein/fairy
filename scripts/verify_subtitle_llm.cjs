@@ -30,7 +30,9 @@ const server = http.createServer((req, res) => {
         reply(res, JSON.stringify({ translations: shifted }));
         return;
       }
-      reply(res, JSON.stringify({ translations: cues.map(c => ({ id: c.id, source: c.source, text: '译文' + c.id })) }));
+      /* 无害规范化差异（多余空白）必须通过比对（canan FC 编号 2037 实测误杀） */
+      const padded = cues.map(c => ({ id: c.id, source: c.source.length > 6 ? c.source.slice(0, 3) + '  ' + c.source.slice(3).replace(/第(\d+)条/, '第 $1 条') : c.source, text: '译文' + c.id }));
+      reply(res, JSON.stringify({ translations: padded }));
       return;
     }
     res.statusCode = 404; res.end('{}');
@@ -57,8 +59,7 @@ server.listen(0, '127.0.0.1', () => {
   child.on('exit', (status) => {
     clearTimeout(killer);
     console.log(out); console.error(err);
-    server.close();
-    if (killed || status !== 0) { console.error('FAIL: exit ' + (killed ? 'timeout' : status)); process.exit(1); }
+    if (killed || status !== 0) { server.close(); console.error('FAIL: exit ' + (killed ? 'timeout' : status)); process.exit(1); }
     const srt = fs.readFileSync(path.join(workDir, 'translated.srt'), 'utf8');
     if (!srt.includes('译文60')) { console.error('FAIL: missing last entry'); process.exit(1); }
     if (chunk2Attempts < 2) { console.error('FAIL: contract retry not exercised'); process.exit(1); }
@@ -67,6 +68,25 @@ server.listen(0, '127.0.0.1', () => {
     if (m3 < 20) { console.error('FAIL: chunk-3 lines missing after split retry: ' + m3); process.exit(1); }
     if (seenChunks.length < 3) { console.error('FAIL: expected >=3 chunks (60 条 / 20) + retry'); process.exit(1); }
     console.log('PASS llm runner, chunks=' + JSON.stringify(seenChunks) + ' chunk2Attempts=' + chunk2Attempts);
-    process.exit(0);
+    /* 断点续跑：同 workDir 二次运行应跳过全部已完成块（0 次 LLM 请求） */
+    seenChunks.length = 0; chunk2Attempts = 0;
+    const child2 = spawn(process.execPath, [runner], { env });
+    let out2 = '', err2 = '';
+    child2.stdout.on('data', c => out2 += c);
+    child2.stderr.on('data', c => err2 += c);
+    const killer2 = setTimeout(() => child2.kill(), 30000);
+    child2.on('exit', (status2) => {
+      clearTimeout(killer2);
+      server.close();
+      console.log(out2); console.error(err2);
+      if (status2 !== 0) { console.error('FAIL: resume run exit ' + status2); process.exit(1); }
+      /* 断点续跑：前 40 条（块1+块2）必须零重翻；仅上轮靠二分完成的块 3 允许 ≤3 次整块重试（子块断点命中） */
+      const retranslated = seenChunks.length;
+      const srt2 = fs.readFileSync(path.join(workDir, 'translated.srt'), 'utf8');
+      if (!srt2.includes('译文60') || !srt2.includes('译文1')) { console.error('FAIL: resume run output missing'); process.exit(1); }
+      if (retranslated > 3) { console.error('FAIL: resume run made ' + retranslated + ' LLM calls, expected <=3 (earlier chunks must come from checkpoint)'); process.exit(1); }
+      console.log('PASS resume run: ' + retranslated + ' LLM call(s) only on the previously-split block, earlier chunks restored from checkpoint');
+      process.exit(0);
+    });
   });
 });
