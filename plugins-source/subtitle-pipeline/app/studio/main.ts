@@ -110,6 +110,7 @@ async function _runTask(task) {
   var me = tasks.find(function (t) { return t.taskId === task.taskId; });
   if (!me) return;
   me.status = 'asr'; me.progressText = '排队启动…'; me.error = '';
+  me.reviewStatus = ''; me.reviewSummary = ''; me.reviewPath = '';
   await _saveTasks(tasks);
   try {
     var r = await hostApi.workflows.start(_wfId || WF_BASE, {
@@ -121,7 +122,7 @@ async function _runTask(task) {
     var me2 = tasks2.find(function (t) { return t.taskId === task.taskId; });
     if (me2) {
       me2.status = ok ? 'done' : 'failed';
-      if (ok) { me2.finalPath = _finalPathFor(me2.mediaPath); me2.progressText = '完成 · 请结合原音复核对照报告'; }
+      if (ok) { me2.finalPath = _finalPathFor(me2.mediaPath); me2.progressText = '完成 · ' + (me2.reviewSummary || '请结合原音复核对照报告'); }
       else if (!me2.error) me2.error = '工作流执行失败（详见错误日历/日志）';
       me2.finishedAt = Date.now();
       await _saveTasks(tasks2);
@@ -191,6 +192,7 @@ module.exports = {
       t.language = payload.language;
     }
     t.reviewPath = ''; t.sourceLang = ''; t.model = ''; t.finalPath = '';
+    t.reviewStatus = ''; t.reviewSummary = '';
     t.timelineWarnings = [];
     t.autoRetries = 0; /* 手动重试 = 用户意志，重新授予 3 次自动恢复额度 */
     t.status = 'queued'; t.error = ''; t.progressText = '排队重试'; t.finishedAt = 0;
@@ -266,6 +268,7 @@ module.exports = {
       var recoverableFailed = t.status === 'failed' && RECOVERABLE_RE.test(t.error || '');
       if (!midState && !recoverableFailed) return;
       t.status = 'queued';
+      t.reviewStatus = ''; t.reviewSummary = '';
       t.progressText = '自动恢复排队（第 ' + ((t.autoRetries || 0) + 1) + ' 次自动重试）';
       t.autoRetries = (t.autoRetries || 0) + 1;
       t.error = '';
@@ -282,6 +285,8 @@ module.exports = {
     var t = tasks.find(function (x) { return x.taskId === payload.taskId; });
     if (!t) return { ok: true };
     if (typeof payload.reviewPath === 'string') t.reviewPath = payload.reviewPath;
+    if (typeof payload.reviewStatus === 'string') t.reviewStatus = payload.reviewStatus;
+    if (typeof payload.reviewSummary === 'string') t.reviewSummary = payload.reviewSummary;
     if (typeof payload.sourceLang === 'string') t.sourceLang = payload.sourceLang;
     if (typeof payload.model === 'string') t.model = payload.model;
     if (Array.isArray(payload.timelineWarnings)) t.timelineWarnings = payload.timelineWarnings;

@@ -25,9 +25,11 @@ test('settings expose effective future-run model and opt-in controls', async () 
   assert.equal(cfg.retainDiagnostics, true); assert.equal(cfg.glossaryPaths.length, 1);
 });
 test('retry may explicitly override unknown language; running tasks cannot retry', async () => {
-  const { api, kv } = plugin('app/studio', { tasks: JSON.stringify([{ taskId: 'a', status: 'failed', language: 'auto' }, { taskId: 'b', status: 'asr', language: 'en' }]) });
+  const { api, kv } = plugin('app/studio', { tasks: JSON.stringify([{ taskId: 'a', status: 'failed', language: 'auto', reviewStatus: 'pending_recheck', reviewSummary: '已修订，待复核' }, { taskId: 'b', status: 'asr', language: 'en' }]) });
   await api.retryTask({ taskId: 'a', language: 'ja' });
   assert.equal(JSON.parse(kv.get('tasks'))[0].language, 'ja');
+  assert.equal(JSON.parse(kv.get('tasks'))[0].reviewStatus, '');
+  assert.equal(JSON.parse(kv.get('tasks'))[0].reviewSummary, '');
   await assert.rejects(api.retryTask({ taskId: 'b' }), /执行/);
 });
 test('Studio retains task-specific review path and actual requested model', async () => {
@@ -37,11 +39,15 @@ test('Studio retains task-specific review path and actual requested model', asyn
   assert.equal(task.reviewPath, 'C:/data/subtitle-reviews/run/review.html');
   assert.equal(task.model, 'actual-request-model'); assert.equal(task.sourceLang, 'ja');
   assert.equal(task.timelineWarnings[0].id, 45);
+  await api.storeProgress({ taskId: 'a', reviewStatus: 'pending_recheck', reviewSummary: '已修订，待复核' });
+  const revised = JSON.parse(kv.get('tasks'))[0];
+  assert.equal(revised.reviewStatus, 'pending_recheck');
+  assert.equal(revised.reviewSummary, '已修订，待复核');
 });
 test('auto-resume recovers idle mid-state and transient failures, respects cap and non-recoverable errors', async () => {
   const { api, kv } = plugin('app/studio', { tasks: JSON.stringify([
     { taskId: 'mid', status: 'translating' },
-    { taskId: 'net', status: 'failed', error: 'llmtranslate: runner timed out (2h)' },
+    { taskId: 'net', status: 'failed', error: 'llmtranslate: runner timed out (2h)', reviewStatus: 'no_issues_detected', reviewSummary: '模型未检出所列问题' },
     { taskId: 'stall', status: 'failed', error: 'asr: 10 分钟无进度，判定停滞' },
     { taskId: 'contract', status: 'failed', error: '块 3/10 翻译失败: 行数不符: expect 20 got 18' },
     { taskId: 'auth', status: 'failed', error: 'HTTP 401: unauthorized' },
@@ -53,6 +59,7 @@ test('auto-resume recovers idle mid-state and transient failures, respects cap a
   assert.equal(tasks.mid.status, 'queued'); assert.ok(tasks.mid.progressText.includes('自动恢复'));
   assert.equal(tasks.net.status, 'queued'); assert.equal(tasks.stall.status, 'queued');
   assert.equal(tasks.net.autoRetries, 1);
+  assert.equal(tasks.net.reviewStatus, ''); assert.equal(tasks.net.reviewSummary, '');
   assert.equal(tasks.contract.status, 'failed'); /* 契约失败需人工（看报告） */
   assert.equal(tasks.auth.status, 'failed'); /* 鉴权类错误不自动重试 */
   assert.equal(tasks.capped.status, 'failed'); /* 达 3 次上限不再自动 */

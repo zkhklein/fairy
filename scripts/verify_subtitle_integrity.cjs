@@ -36,6 +36,7 @@ async function scenario(t, options = {}) {
   const workDir = path.join(tmp, 'work'); fs.mkdirSync(workDir);
   const srtPath = path.join(workDir, 'raw.srt');
   fs.writeFileSync(srtPath, options.srt ?? srt(['Please bring', 'the blue book.', 'The train leaves at noon.']));
+  if (options.checkpoint) fs.writeFileSync(path.join(workDir, 'translate-progress.ndjson'), options.checkpoint.map(x => JSON.stringify(x)).join('\n') + '\n');
   const calls = [], results = [], events = [];
   const server = http.createServer((req, res) => {
     let data = ''; req.on('data', x => data += x); req.on('end', () => {
@@ -101,6 +102,22 @@ test('unknown automatic language stops before paid requests', async t => {
   assert.notEqual(r.code, 0); assert.equal(r.calls.length, 0);
   assert.match(r.result.error, /语言/);
 });
+test('new report and failed re-review replace previous Studio quality status', async t => {
+  const r = await scenario(t, { params: { semanticReview: true }, respond: body => {
+    if (body.messages[0].content.includes('对齐复核')) return completion('[]');
+    return defaultResponse(body);
+  } });
+  assert.notEqual(r.code, 0);
+  const updates = r.events.filter(e => e.action === 'storeProgress').map(e => e.payload);
+  const initial = updates.find(e => e.reviewPath && e.stage !== 'error');
+  assert.equal(initial.reviewStatus, 'in_progress');
+  assert.match(initial.reviewSummary, /尚未完成/);
+  const failed = updates.findLast(e => e.stage === 'error');
+  assert.equal(failed.reviewStatus, 'failed');
+  assert.match(failed.reviewSummary, /失败/);
+  const report = JSON.parse(fs.readFileSync(path.join(path.dirname(r.result.reviewPath), 'review.json'), 'utf8'));
+  assert.equal(report.reviewStatus, 'failed');
+});
 test('preserve nonsequential original IDs and timestamps', async t => {
   const r = await scenario(t, { srt: srt(['Hello.', 'See you.'], [7, 12]) });
   assert.equal(r.code, 0, r.output);
@@ -144,6 +161,79 @@ test('optional alignment review auto-redoes flagged entries instead of failing',
   assert.equal(redone.length, 2);
   assert.ok(redone.every(e => e.reason.includes('复核意见')));
   assert.ok(report.entries.some(e => e.translation === '重翻1') && report.entries.some(e => e.translation === '重翻3'));
+  assert.equal(report.reviewStatus, 'pending_recheck');
+  assert.match(report.status, /已修订，待复核/);
+  assert.doesNotMatch(report.status, /复核通过/);
+  assert.ok(redone.every(e => e.reviewHistory[0].translation === '初翻'));
+  assert.equal(r.calls.length, 3, 'do not silently add paid re-review calls');
+  const saved = fs.readFileSync(path.join(r.workDir, 'translate-progress.ndjson'), 'utf8').trim().split('\n').map(JSON.parse).at(-1);
+  assert.equal(saved.texts[1], '重翻1'); assert.equal(saved.texts[3], '重翻3');
+});
+
+test('redo ID44 carries adjacent original ID43 and following ID45 within its block', async t => {
+  const texts = ['The delivery will arrive.', 'Please wait here.', 'A cup is on the table.', 'There is a book', 'case in the hallway.', 'Please bring it upstairs.'];
+  const r = await scenario(t, { srt: srt(texts, [40, 41, 42, 43, 44, 45]), params: { semanticReview: true }, respond: body => {
+    if (body.messages[0].content.includes('对齐复核')) return completion(JSON.stringify([40, 41, 42, 43, 44, 45].map(id => ({ id, verdict: id === 44 ? 'shifted' : 'ok', reason: id === 44 ? 'case is the continuation of book in ID43, not a standalone legal case' : '' }))));
+    return defaultResponse(body);
+  } });
+  assert.equal(r.code, 0, r.output);
+  const redo = JSON.parse(r.calls.at(-1).messages[1].content);
+  assert.deepEqual(redo.cues.map(c => c.id), [44]);
+  assert.deepEqual(redo.before_context.map(c => c.id), [41, 42, 43]);
+  assert.equal(redo.before_context.at(-1).source, 'There is a book');
+  assert.deepEqual(redo.after_context.map(c => c.id), [45]);
+  assert.equal(redo.after_context[0].source, 'Please bring it upstairs.');
+});
+
+test('noncontiguous redo IDs keep the intervening source as context without translating it', async t => {
+  const r = await scenario(t, { params: { semanticReview: true }, respond: body => {
+    if (body.messages[0].content.includes('对齐复核')) return completion(JSON.stringify([1, 2, 3].map(id => ({ id, verdict: id === 2 ? 'ok' : 'omitted', reason: id === 2 ? '' : 'Missing source meaning' }))));
+    return defaultResponse(body);
+  } });
+  assert.equal(r.code, 0, r.output);
+  const redo = JSON.parse(r.calls.at(-1).messages[1].content);
+  assert.deepEqual(redo.cues.map(c => c.id), [1, 3]);
+  assert.deepEqual(redo.span_context.map(c => c.id), [1, 2, 3]);
+  assert.equal(redo.span_context[1].source, 'the blue book.');
+});
+
+for (const verdict of ['pronoun_error', 'entity_mismatch', 'mistranslation', 'style_mismatch', 'asr_suspect', 'needs_audio', 'uncertain']) {
+  test('review accepts and preserves ' + verdict + ' with evidence, without claiming accuracy', async t => {
+    const r = await scenario(t, { params: { semanticReview: true, glossary: 'May is a person, not the month.' }, respond: body => {
+      if (body.messages[0].content.includes('对齐复核')) return completion(JSON.stringify([1, 2, 3].map(id => ({ id, verdict: id === 2 ? verdict : 'ok', reason: id === 2 ? 'Text evidence is insufficient; compare the surrounding dialogue.' : '' }))));
+      return defaultResponse(body);
+    } });
+    assert.equal(r.code, 0, r.output);
+    const report = JSON.parse(fs.readFileSync(path.join(path.dirname(r.result.reviewPath), 'review.json'), 'utf8'));
+    assert.equal(report.entries[1].verdict, verdict);
+    assert.equal(report.reviewStatus, 'needs_attention');
+    assert.equal(r.calls.length, 2, 'new quality categories must not trigger speculative automatic rewriting');
+    const request = r.calls.find(b => b.messages[0].content.includes('对齐复核'));
+    const payload = JSON.parse(request.messages[1].content);
+    assert.equal(payload.reference, 'May is a person, not the month.');
+    assert.equal(payload.speaker_info.usable, false);
+    assert.ok(request.messages[0].content.includes(verdict));
+    assert.doesNotMatch(report.status, /复核通过/);
+  });
+}
+
+test('a non-ok review needs a nonempty reason', async t => {
+  const r = await scenario(t, { params: { semanticReview: true }, respond: body => {
+    if (body.messages[0].content.includes('对齐复核')) return completion(JSON.stringify([1, 2, 3].map(id => ({ id, verdict: id === 1 ? 'shifted' : 'ok', reason: '' }))));
+    return defaultResponse(body);
+  } });
+  assert.notEqual(r.code, 0); assert.equal(r.calls.length, 2);
+});
+
+test('checkpoint restoration does not bypass enabled semantic review', async t => {
+  const r = await scenario(t, { checkpoint: [{ key: '1-3', texts: { 1: '旧译1', 2: '旧译2', 3: '旧译3' } }], params: { semanticReview: true }, respond: body => {
+    assert.ok(body.messages[0].content.includes('对齐复核'), 'translation should be restored, not paid again');
+    return completion(JSON.stringify([1, 2, 3].map(id => ({ id, verdict: id === 2 ? 'needs_audio' : 'ok', reason: id === 2 ? 'Unclear noun in the source' : '' }))));
+  } });
+  assert.equal(r.code, 0, r.output); assert.equal(r.calls.length, 1);
+  const report = JSON.parse(fs.readFileSync(path.join(path.dirname(r.result.reviewPath), 'review.json'), 'utf8'));
+  assert.equal(report.entries[1].verdict, 'needs_audio');
+  assert.equal(report.reviewStatus, 'needs_attention');
 });
 test('persist escaped review and redacted diagnostics outside disposable workDir', async t => {
   const r = await scenario(t, { srt: srt(['Hello <script>alert(1)</script>.']), params: { retainDiagnostics: true, glossary: 'blue book = 蓝色的书' }, respond: () => completion('{"translations":[{"id":1,"source":"Hello <script>alert(1)</script>.","text":"你好"}]}') });
@@ -194,7 +284,7 @@ for (const bad of ['length', 'content_filter', 'tool_calls', null]) {
     assert.notEqual(r.code, 0); assert.equal(r.calls.length, 1);
   });
 }
-for (const kind of ['missing', 'duplicate', 'extra', 'unknown-verdict']) {
+for (const kind of ['missing', 'duplicate', 'extra', 'unknown-verdict', 'nonstring-verdict']) {
   test('alignment reviewer cannot pass with ' + kind + ' judgments', async t => {
     const r = await scenario(t, { params: { semanticReview: true }, respond: body => {
       if (!body.messages[0].content.includes('对齐复核')) return defaultResponse(body);
@@ -203,6 +293,7 @@ for (const kind of ['missing', 'duplicate', 'extra', 'unknown-verdict']) {
       if (kind === 'duplicate') items[2].id = 2;
       if (kind === 'extra') items[2].id = 4;
       if (kind === 'unknown-verdict') items[2].verdict = 'probably';
+      if (kind === 'nonstring-verdict') { items[2].verdict = ['ok']; items[2].reason = 'Array must not be coerced to an enum string'; }
       return completion(JSON.stringify(items));
     } });
     assert.notEqual(r.code, 0); assert.match(r.result.error, /复核/);

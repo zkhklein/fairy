@@ -3,6 +3,25 @@
   var fs = require('fs'), path = require('path'), http = require('http'), https = require('https'), crypto = require('crypto');
   /*__FMB_SRT__*/
   var secrets = [], reviewDir = '', report = null;
+  // One vocabulary drives the prompt and validator; ok is a limited observation, not accuracy.
+  var REVIEW_CRITERIA = {
+    ok: '未检出以下检查项的问题，不代表翻译准确或原音已确认',
+    shifted: '含义提前或挪后；结合完整词句及相邻字幕检查，不能孤立检查词尾',
+    omitted: '遗漏原文信息',
+    pronoun_error: '谁说、说谁、谁做动作或转述对象发生变化',
+    entity_mismatch: '姓名被当普通名词，或有依据的名称/称呼不一致；只用本次提供的参考',
+    mistranslation: '否定、请求、比较、转述或动作含义改变',
+    style_mismatch: '中文生硬，或与已确认角色语气不符；不得新增情节或情绪',
+    asr_suspect: '原稿残缺、不合语法、无依据专名/数字或突兀话题，需原音核查',
+    needs_audio: '文本证据不足或与参考矛盾，不能仅凭参考重建原音',
+    uncertain: '其他无法从现有证据确定的问题'
+  };
+  function buildReviewSystem() {
+    return '你是字幕对齐复核员。逐 ID 对照不可变原文、译文、相邻完整词句与当前参考资料，按以下维度检查：\n' +
+      Object.keys(REVIEW_CRITERIA).map(function (key) { return key + ': ' + REVIEW_CRITERIA[key]; }).join('\n') +
+      '\n无可靠 speaker 时不得猜测角色身份、声线或把通用代号当人名。参考是命名/风格证据，不是原音真值。疑似听写错误优先标 asr_suspect 或 needs_audio，不臆造修正。' +
+      '\n一条有多个问题时优先报告需要原音确认的问题，其余写入 reason。只输出 JSON 数组，每个待复核 cues 的 ID 恰好一次：{"id":整数,"verdict":"' + Object.keys(REVIEW_CRITERIA).join('|') + '","reason":"具体原文/译文证据及涉及的ID"}。非 ok 的 reason 必须非空。不改写译文；ok 仅表示未检出这些问题，不是准确率结论。';
+  }
   function redact(value) {
     if (typeof value === 'string') {
       secrets.forEach(function (secret) {
@@ -31,7 +50,11 @@
     var safe = redact(report);
     fs.writeFileSync(path.join(reviewDir, 'review.json'), JSON.stringify(safe, null, 2), 'utf8');
     function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]; }); }
-    var rows = safe.entries.map(function (e) { return '<tr><td>' + e.id + '<br>' + esc(e.start) + '<br>' + esc(e.end) + '</td><td>' + esc(e.source) + '</td><td>' + esc(e.translation) + '</td><td>' + esc(e.verdict || '未做模型复核') + '<br>' + esc(e.reason) + '</td></tr>'; }).join('');
+    var rows = safe.entries.map(function (e) {
+      var label = e.verdict === 'auto-redone' ? '已修订，待复核' : e.verdict === 'ok' ? '未检出所列问题' : (e.verdict || '未做模型复核');
+      var history = e.reviewHistory ? '<details><summary>修订前复核记录</summary><pre>' + esc(JSON.stringify(e.reviewHistory, null, 2)) + '</pre></details>' : '';
+      return '<tr><td>' + e.id + '<br>' + esc(e.start) + '<br>' + esc(e.end) + '</td><td>' + esc(e.source) + '</td><td>' + esc(e.translation) + '</td><td>' + esc(label) + '<br>' + esc(e.reason) + history + '</td></tr>';
+    }).join('');
     var html = '<!doctype html><html lang="zh"><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src \'none\'; style-src \'unsafe-inline\'"><title>字幕对齐复核</title><style>body{font:16px system-ui;margin:24px}table{border-collapse:collapse;width:100%}td,th{border:1px solid #bbb;padding:10px;vertical-align:top;white-space:pre-wrap}tr:nth-child(even){background:#f4f4f4}</style><h1>字幕对齐复核</h1><p>请逐条对照相邻原文和译文，并结合原音检查串位、省略和听写错误。编号/时间轴一致及模型复核均不能保证语义准确；参考资料不是原音真值。</p><p>状态：' + esc(safe.status) + ' ' + esc(safe.error) + '</p><p>本次请求模型：' + esc(safe.config.model) + '；源语言：' + esc(safe.config.sourceLang) + '；模型复核：' + esc(safe.config.semanticReview) + '</p><table><thead><tr><th>ID / 时间轴</th><th>原文</th><th>译文</th><th>模型复核</th></tr></thead><tbody>' + rows + '</tbody></table></html>';
     if (safe.timelineWarnings.length) {
       var notice = '<h2>时间轴质量警告：零时长</h2><p>以下条目完整保留，未删除或调整时间；翻译与结构校验通过不代表时间轴质量合格。请依据原音核查。</p><ul>' + safe.timelineWarnings.map(function (w) { return '<li>ID ' + w.id + '：' + esc(w.start) + ' → ' + esc(w.end) + '</li>'; }).join('') + '</ul>';
@@ -75,7 +98,7 @@
     return chunks;
   }
   function parseTranslations(content, cues) {
-    /* JSON 契约（同步 SUCCUBUSQ subtitles.py validate_translations）：source 逐字回显校验抓内容串位 */
+    /* JSON/source 回显只能验证结构与来源绑定，不能证明译文语义对齐。 */
     var value;
     try { value = JSON.parse(content); } catch (_) { throw new Error('输出不是有效 JSON 对象'); }
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('输出必须是 JSON 对象');
@@ -208,18 +231,19 @@
     if (!/^https?:$/.test(endpoint.protocol) || endpoint.username || endpoint.password || endpoint.search || endpoint.hash) throw fatal('API Base 必须是无凭据、查询参数和片段的 HTTP(S) 地址');
     reviewDir = path.join(P.fmbDataDir, 'subtitle-reviews', crypto.randomUUID());
     fs.mkdirSync(reviewDir, { recursive: true });
-    report = { version: 1, taskId: P.taskId, startedAt: new Date().toISOString(), status: 'translating', timelineWarnings: warnings,
-      config: { model: P.model || 'Qwen/Qwen2.5-72B-Instruct', apiBase: apiBase, sourceLang: sourceLang || 'unknown', semanticReview: !!P.semanticReview, retainDiagnostics: !!P.retainDiagnostics, promptVersion: 'json-contract-v2', chunkEntries: 20, chunkChars: 2000, speakerInfo: speakerInfo },
+    report = { version: 1, taskId: P.taskId, startedAt: new Date().toISOString(), status: 'translating', reviewStatus: 'in_progress', timelineWarnings: warnings,
+      config: { model: P.model || 'Qwen/Qwen2.5-72B-Instruct', apiBase: apiBase, sourceLang: sourceLang || 'unknown', semanticReview: !!P.semanticReview, retainDiagnostics: !!P.retainDiagnostics, promptVersion: 'json-contract-v3', reviewContractVersion: 'quality-v1', reviewCategories: Object.keys(REVIEW_CRITERIA), revisionPolicy: 'mark-pending-no-extra-review', chunkEntries: 20, chunkChars: 2000, speakerInfo: speakerInfo },
       references: { pastedSha256: P.glossary ? crypto.createHash('sha256').update(P.glossary).digest('hex') : null, files: [] },
       entries: entries.map(function (e) { return { id: e.id, start: e.start, end: e.end, source: e.text, translation: '', speaker: e.speaker || null }; }) };
     var glossary = loadGlossary();
     var initialReviewPath = saveReport();
-    await postInvoke(meta, P.studioPluginId, 'storeProgress', { taskId: P.taskId, reviewPath: initialReviewPath, sourceLang: sourceLang || 'unknown', model: report.config.model });
+    await postInvoke(meta, P.studioPluginId, 'storeProgress', { taskId: P.taskId, reviewPath: initialReviewPath, reviewStatus: 'in_progress', reviewSummary: '本次翻译/复核尚未完成', sourceLang: sourceLang || 'unknown', model: report.config.model });
     /* 零条目 srt 合法（全静音媒体）：写空 translated.srt 并直接报告成功，不取 key、不调 LLM */
     if (!entries.length) {
       var emptyPath = path.join(P.workDir, 'translated.srt');
       fs.writeFileSync(emptyPath, '', 'utf8');
-      report.status = '空字幕（未调用模型）'; var emptyReviewPath = saveReport();
+      report.status = '空字幕（未调用模型）'; report.reviewStatus = 'not_run'; var emptyReviewPath = saveReport();
+      await postInvoke(meta, P.studioPluginId, 'storeProgress', { taskId: P.taskId, reviewStatus: report.reviewStatus, reviewSummary: report.status });
       console.log(JSON.stringify({ ok: true, translatedSrtPath: emptyPath, lineCount: 0, chunks: 0, tokens: 0 }));
       await postInvoke(meta, P.callbackPluginId, 'storeResult', { taskId: P.taskId, ok: true, translatedSrtPath: emptyPath, lineCount: 0, chunks: 0, usage: { total_tokens: 0 }, reviewPath: emptyReviewPath });
       return;
@@ -231,22 +255,17 @@
     var src = ({ ja: '日语', en: '英语' })[sourceLang] || sourceLang;
     var chunks = chunkEntries(entries, 20, 2000);
     // Splitting only recovers structural failures. Context is immutable even after earlier chunks translate.
-    function context(offset, count) {
-      var before = origTexts.slice(Math.max(0, offset - 3), offset).join('\n');
-      var after = origTexts.slice(offset + count, offset + count + 3).join('\n');
-      return '【前文】\n' + before + '\n\n【后文】\n' + after;
+    function ctxSlice(from, to) {
+      var out = [];
+      for (var i = Math.max(0, from); i < to && i < entries.length; i++) {
+        var cue = { id: entries[i].id, source: origTexts[i] };
+        if (useSpeakers && entries[i].speaker) cue.speaker = 'SPEAKER_' + entries[i].speaker;
+        out.push(cue);
+      }
+      return out;
     }
     async function translateRange(offset, count, ci, depth, tokenBox) {
       /* 上下文/待译条目一律取 origTexts 快照：前序块完成后 entries.text 已是译文（SUCCUBUSQ Cue 不可变语义） */
-      function ctxSlice(from, to) {
-        var out = [];
-        for (var i = from; i < to && i < entries.length; i++) {
-          var cue = { id: entries[i].id, source: origTexts[i] };
-          if (useSpeakers && entries[i].speaker) cue.speaker = 'SPEAKER_' + entries[i].speaker;
-          out.push(cue);
-        }
-        return out;
-      }
       /* 二分子块断点兜底：主块 key 未命中（上轮靠二分完成）时子块可整段命中，避免契约重试白跑 */
       if (applyDone(offset, count)) return entries.slice(offset, offset + count).map(function (e) { return e.text; });
       var cues = ctxSlice(offset, offset + count);
@@ -314,17 +333,17 @@
     var tokenBox = { total: 0 };
     for (var ci = 0; ci < chunks.length; ci++) {
       var chunk = chunks[ci], offset = entries.indexOf(chunk[0]);
-      if (applyDone(offset, chunk.length)) {
-        saveReport();
+      var resumed = applyDone(offset, chunk.length);
+      if (resumed) {
         await postInvoke(meta, P.studioPluginId, 'storeProgress', { taskId: P.taskId, stage: 'translating', text: '翻译中 · 块 ' + (ci + 1) + '/' + chunks.length + '（断点续跑）' });
         await postInvoke(meta, P.callbackPluginId, 'storeProgress', { taskId: P.taskId, ts: Date.now() });
-        continue;
       }
-      var translated = await translateRange(offset, chunk.length, ci, 0, tokenBox);
+      var translated = resumed ? entries.slice(offset, offset + chunk.length).map(function (e) { return e.text; }) : await translateRange(offset, chunk.length, ci, 0, tokenBox);
       for (var k2 = 0; k2 < chunk.length; k2++) { chunk[k2].text = translated[k2]; report.entries[offset + k2].translation = translated[k2]; }
       saveReport();
       if (P.semanticReview) {
-        var reviewMessages = [{ role: 'system', content: '你是字幕对齐复核员。逐 ID 对照原文与译文及相邻语境，检查含义提前/挪后(shifted)、信息省略(omitted)，否则 ok。编号齐全不等于语义正确，跨行半句允许自然表达，但不得挪用其他 ID 的含义。不改写译文。只输出 JSON 数组，每个待复核 ID 恰好一次：{"id":整数,"verdict":"ok|shifted|omitted","reason":"依据"}。' }, { role: 'user', content: context(offset, chunk.length) + '\n\n【待复核】\n' + JSON.stringify(report.entries.slice(offset, offset + chunk.length)) }];
+        var reviewPayload = { reference: glossary, speaker_info: speakerInfo, before_context: ctxSlice(offset - 3, offset), cues: report.entries.slice(offset, offset + chunk.length), after_context: ctxSlice(offset + chunk.length, offset + chunk.length + 3) };
+        var reviewMessages = [{ role: 'system', content: buildReviewSystem() }, { role: 'user', content: JSON.stringify(reviewPayload) }];
         var reviewed = await callWithRetry(cfg, reviewMessages, 0);
         tokenBox.total += reviewed.usage.total_tokens || 0;
         var judgments;
@@ -332,24 +351,26 @@
         var reviewIds = new Set(chunk.map(function (e) { return e.id; }));
         if (!Array.isArray(judgments) || judgments.length !== chunk.length) throw fatal('对齐复核编号集合不完整');
         judgments.forEach(function (j) {
-          if (!j || !reviewIds.delete(j.id) || !['ok', 'shifted', 'omitted'].includes(j.verdict) || typeof j.reason !== 'string') throw fatal('对齐复核编号/结论无效');
-          var row = report.entries.find(function (e) { return e.id === j.id; }); row.verdict = j.verdict; row.reason = j.reason;
+          if (!j || !reviewIds.delete(j.id) || typeof j.verdict !== 'string' || !Object.prototype.hasOwnProperty.call(REVIEW_CRITERIA, j.verdict) || typeof j.reason !== 'string' || (j.verdict !== 'ok' && !j.reason.trim())) throw fatal('对齐复核编号/结论/依据无效');
+          var row = report.entries.find(function (e) { return e.id === j.id; }); row.verdict = j.verdict; row.reason = j.reason; row.reviewState = j.verdict === 'ok' ? 'no_issues_detected' : 'needs_attention';
         });
-        /* shifted/omitted 自动重翻（带复核意见反馈），不再二轮复核防循环；仍受 source 逐字契约保护 */
-        var bad = judgments.filter(function (j) { return j.verdict !== 'ok'; });
+        /* Only existing structural flags trigger one rewrite. Other quality findings need human/audio review. */
+        var bad = judgments.filter(function (j) { return j.verdict === 'shifted' || j.verdict === 'omitted'; });
         if (bad.length) {
           var badIds = new Set(bad.map(function (j) { return j.id; }));
-          var redoCues = [];
-          for (var i2 = offset; i2 < offset + chunk.length; i2++) if (badIds.has(entries[i2].id)) redoCues.push({ id: entries[i2].id, source: origTexts[i2] });
+          var redoCues = [], redoPositions = [];
+          for (var i2 = offset; i2 < offset + chunk.length; i2++) if (badIds.has(entries[i2].id)) { redoCues.push(ctxSlice(i2, i2 + 1)[0]); redoPositions.push(i2); }
+          var firstRedo = redoPositions[0], lastRedo = redoPositions[redoPositions.length - 1];
           var redoPayload = {
             reference: glossary,
-            before_context: entries.slice(Math.max(0, offset - 3), offset).map(function (e, i3) { return { id: e.id, source: origTexts[Math.max(0, offset - 3) + i3] }; }),
+            before_context: ctxSlice(firstRedo - 3, firstRedo),
             cues: redoCues,
-            after_context: entries.slice(offset + chunk.length, offset + chunk.length + 3).map(function (e, i4) { return { id: e.id, source: origTexts[offset + chunk.length + i4] }; }),
+            after_context: ctxSlice(lastRedo + 1, lastRedo + 4),
+            span_context: ctxSlice(firstRedo, lastRedo + 1),
             review_feedback: bad.map(function (j) { return { id: j.id, problem: j.verdict, reason: j.reason }; }),
           };
           var redoMsgs = [
-            { role: 'system', content: buildSystem(src, useSpeakers) + '\n以下是复核员对上一版译文的意见，请针对被点名条目严格修正（只译被点名条目，不得挪用其他条目含义）：' + JSON.stringify(bad.map(function (j) { return { id: j.id, problem: j.verdict, reason: j.reason }; })) },
+            { role: 'system', content: buildSystem(src, useSpeakers) + '\nspan_context 保留待修订范围内完整原文，包括未点名的中间条目，仅供理解完整词句；只输出 cues 中点名的 ID，不得把孤立词尾当独立话语。以下是复核员对上一版译文的意见：' + JSON.stringify(bad.map(function (j) { return { id: j.id, problem: j.verdict, reason: j.reason }; })) },
             { role: 'user', content: JSON.stringify(redoPayload) },
           ];
           var redo = await callWithRetry(cfg, redoMsgs, 0.15);
@@ -359,29 +380,40 @@
             var i5 = entries.findIndex(function (e) { return e.id === j.id; });
             entries[i5].text = redoMap[j.id];
             var row2 = report.entries.find(function (e) { return e.id === j.id; });
+            row2.reviewHistory = [{ verdict: j.verdict, reason: j.reason, translation: row2.translation }];
             row2.translation = redoMap[j.id];
             row2.verdict = 'auto-redone';
-            row2.reason = '复核意见: ' + j.reason + '（已自动重翻，请人工抽查）';
+            row2.reviewState = 'revised_pending_review';
+            row2.reason = '复核意见: ' + j.reason + '（已修订，待复核；未再次调用模型复核）';
           });
         }
         saveReport();
       }
+      // Persist the latest text, including revisions; restored text must still traverse review when enabled.
+      var finalCheckpoint = { key: entries[offset].id + '-' + entries[offset + chunk.length - 1].id, texts: {} };
+      chunk.forEach(function (e) { finalCheckpoint.texts[e.id] = e.text; });
+      fs.appendFileSync(progressPath, JSON.stringify(finalCheckpoint) + '\n', 'utf8');
       await postInvoke(meta, P.studioPluginId, 'storeProgress', { taskId: P.taskId, stage: 'translating', text: '翻译中 · 块 ' + (ci + 1) + '/' + chunks.length });
       await postInvoke(meta, P.callbackPluginId, 'storeProgress', { taskId: P.taskId, ts: Date.now() });
     }
     var totalTokens = tokenBox.total;
     var outPath = path.join(P.workDir, 'translated.srt');
     fs.writeFileSync(outPath, formatSrt(entries), 'utf8');
-    report.status = P.semanticReview ? '模型复核通过，仍需人工结合原音确认' : '结构校验通过，语义待人工复核'; report.totalTokens = totalTokens;
+    var pending = report.entries.filter(function (e) { return e.verdict === 'auto-redone'; }).length;
+    var attention = report.entries.filter(function (e) { return e.verdict && e.verdict !== 'ok' && e.verdict !== 'auto-redone'; }).length;
+    report.reviewStatus = !P.semanticReview ? 'not_run' : pending ? 'pending_recheck' : attention ? 'needs_attention' : 'no_issues_detected';
+    report.status = !P.semanticReview ? '结构校验通过，语义待人工复核' : pending ? '已修订，待复核（' + pending + ' 条修订未复核；另有 ' + attention + ' 条待确认）' : attention ? '有 ' + attention + ' 条质量疑点，待人工或原音核查' : '模型未检出所列问题，仍需人工结合原音确认';
+    report.totalTokens = totalTokens;
     var reviewPath = saveReport();
     console.log(JSON.stringify({ ok: true, translatedSrtPath: outPath, lineCount: entries.length, chunks: chunks.length, tokens: totalTokens }));
+    await postInvoke(meta, P.studioPluginId, 'storeProgress', { taskId: P.taskId, reviewStatus: report.reviewStatus, reviewSummary: report.status });
     await postInvoke(meta, P.callbackPluginId, 'storeResult', { taskId: P.taskId, ok: true, translatedSrtPath: outPath, lineCount: entries.length, chunks: chunks.length, usage: { total_tokens: totalTokens }, reviewPath: reviewPath });
   }
   main().then(function () { process.exit(0); }).catch(async function (e) {
     var error = redact(String(e && e.message || e)), reviewPath = '';
-    try { if (report) { report.status = 'failed'; report.error = error; reviewPath = saveReport(); diagnostic('failure', { error: error }); } } catch (_) {}
+    try { if (report) { report.status = 'failed'; report.reviewStatus = 'failed'; report.error = error; reviewPath = saveReport(); diagnostic('failure', { error: error }); } } catch (_) {}
     console.error('llm failed: ' + error);
-    try { var meta = findHttpMeta(P.fmbDataDir); if (meta) { await postInvoke(meta, P.studioPluginId, 'storeProgress', { taskId: P.taskId, stage: 'error', text: error, reviewPath: reviewPath }); await postInvoke(meta, P.callbackPluginId, 'storeResult', { taskId: P.taskId, ok: false, error: error, reviewPath: reviewPath }); } } catch (_) {}
+    try { var meta = findHttpMeta(P.fmbDataDir); if (meta) { await postInvoke(meta, P.studioPluginId, 'storeProgress', { taskId: P.taskId, stage: 'error', text: error, reviewPath: reviewPath, reviewStatus: 'failed', reviewSummary: '本次翻译/复核失败，请查看错误及报告' }); await postInvoke(meta, P.callbackPluginId, 'storeResult', { taskId: P.taskId, ok: false, error: error, reviewPath: reviewPath }); } } catch (_) {}
     setTimeout(function () { process.exit(1); }, 1000);
   });
 })();

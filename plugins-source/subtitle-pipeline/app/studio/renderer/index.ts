@@ -129,7 +129,7 @@ module.exports = {
     var effective = document.createElement('div');
     effective.style.cssText = 'font-size:12px;color:#6b7280;margin:-6px 0 12px 0;';
     cfgPanel.appendChild(effective);
-    var cReview = checkRow('fmb-cfg-review', '启用额外模型对齐复核', '增加 API 调用和费用；不能代替原音/人工校对');
+    var cReview = checkRow('fmb-cfg-review', '启用额外模型质量复核', '增加 API 调用和费用，缓存恢复仍需复核；自动重译后标为待复核，不能代替原音/人工校对');
     var cDiag = checkRow('fmb-cfg-diagnostics', '保留详细诊断', '含字幕原文、参考资料和模型响应；不含密钥；默认关闭');
     cfgPanel.appendChild(cReview.row);
     cfgPanel.appendChild(cDiag.row);
@@ -148,7 +148,7 @@ module.exports = {
     cfgPanel.appendChild(rNode.row);
 
     /* Section 4: 参考资料（术语表） */
-    cfgPanel.appendChild(sectionHeader('参考资料（术语表）', '翻译时注入 prompt 作术语/风格参照；不会自动加载 SUCCUBUSQ 人格或知识库'));
+    cfgPanel.appendChild(sectionHeader('参考资料（术语表）', '全局用于后续任务的翻译与复核；保存会替换路径列表，请勿混用其他作品资料。不会自动加载 SUCCUBUSQ 人格或知识库'));
     var rGlossary = cfgRow('术语表（直接粘贴 markdown）', '', '', false, true);
     var rGpaths = cfgRow('知识库文件路径（每行一个绝对路径；失效跳过不阻断）', '', 'D:\\BOAT\\SUCCUBUSQ\\knowledge\\terminology\\characters.md', false, true);
     cfgPanel.appendChild(rGlossary.row);
@@ -324,6 +324,12 @@ module.exports = {
             modelInfo.textContent = '本次请求模型：' + t.model;
             modelInfo.style.cssText = 'font-size:11px;color:#9ca3af;white-space:normal;';
             tdResult.appendChild(modelInfo);
+          }
+          if (t.reviewSummary) {
+            var reviewInfo = document.createElement('div');
+            reviewInfo.textContent = t.reviewSummary;
+            reviewInfo.style.cssText = 'font-size:12px;white-space:normal;color:' + (t.reviewStatus === 'no_issues_detected' ? '#6b7280' : '#9a5b00') + ';';
+            tdResult.appendChild(reviewInfo);
           }
           if (t.reviewPath) {
             var reportPath = document.createElement('input');
