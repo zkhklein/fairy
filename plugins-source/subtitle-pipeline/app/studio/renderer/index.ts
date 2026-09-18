@@ -48,6 +48,10 @@ module.exports = {
     [['auto', '自动检测'], ['ja', '日语'], ['en', '英语']].forEach(function (o) {
       var op = document.createElement('option'); op.value = o[0]; op.textContent = o[1]; langSel.appendChild(op);
     });
+    /* 语言选择持久化：选过日语后切页/重开不再回退自动检测 */
+    langSel.onchange = function () {
+      hostApi.callPluginMainAction('setConfig', { prefLanguage: langSel.value }).catch(function () {});
+    };
 
     var btnCfg = document.createElement('button');
     btnCfg.textContent = '⚙ 配置';
@@ -150,9 +154,51 @@ module.exports = {
     /* Section 4: 参考资料（术语表） */
     cfgPanel.appendChild(sectionHeader('参考资料（术语表）', '全局用于后续任务的翻译与复核；保存会替换路径列表，请勿混用其他作品资料。不会自动加载 SUCCUBUSQ 人格或知识库'));
     var rGlossary = cfgRow('术语表（直接粘贴 markdown）', '', '', false, true);
-    var rGpaths = cfgRow('知识库文件路径（每行一个绝对路径；失效跳过不阻断）', '', 'D:\\BOAT\\SUCCUBUSQ\\knowledge\\terminology\\characters.md', false, true);
     cfgPanel.appendChild(rGlossary.row);
-    cfgPanel.appendChild(rGpaths.row);
+    /* 知识库文件路径：可视化列表（添加按钮走系统文件选择器），替代手输 textarea */
+    var gpWrap = document.createElement('div');
+    gpWrap.style.cssText = 'margin-bottom:12px;';
+    var gpLabel = document.createElement('div');
+    gpLabel.style.cssText = 'font-size:13px;color:#374151;margin-bottom:6px;';
+    gpLabel.textContent = '知识库文件路径（失效跳过不阻断）';
+    gpWrap.appendChild(gpLabel);
+    var gpList = document.createElement('div');
+    gpList.style.cssText = 'border:1px solid #d1d5db;border-radius:6px;background:#fff;min-height:36px;';
+    gpWrap.appendChild(gpList);
+    var gpAdd = document.createElement('button');
+    gpAdd.textContent = '＋ 添加文件';
+    gpAdd.style.cssText = 'margin-top:6px;padding:5px 12px;background:#fff;color:#5b21b6;border:1px solid #c4b5fd;border-radius:6px;cursor:pointer;font-size:12px;';
+    gpAdd.onclick = function () {
+      window.fmb.dialogShowOpen({
+        title: '选择知识库文件', multiSelections: true, openFile: true, openDirectory: false,
+        filters: [{ name: '参考资料', extensions: ['md', 'txt', 'markdown'] }],
+      }).then(function (r) {
+        var paths = (r && !r.canceled && Array.isArray(r.filePaths)) ? r.filePaths : [];
+        if (!paths.length) return;
+        paths.forEach(function (p) { if (!gpathsAll().includes(p)) addGpathRow(p); });
+      }).catch(function () {});
+    };
+    gpWrap.appendChild(gpAdd);
+    function gpathsAll() {
+      return Array.prototype.map.call(gpList.querySelectorAll('[data-path]'), function (el) { return el.getAttribute('data-path'); });
+    }
+    function addGpathRow(p) {
+      var row = document.createElement('div');
+      row.setAttribute('data-path', p);
+      row.style.cssText = 'display:flex;align-items:center;gap:6px;padding:5px 8px;border-bottom:1px solid #f3f4f6;font-size:12px;';
+      var t = document.createElement('span');
+      t.textContent = p;
+      t.title = p;
+      t.style.cssText = 'flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#374151;direction:rtl;text-align:left;';
+      var del = document.createElement('button');
+      del.textContent = '×';
+      del.title = '移除';
+      del.style.cssText = 'flex:none;width:20px;height:20px;line-height:1;border:none;background:#fee2e2;color:#dc2626;border-radius:4px;cursor:pointer;font-size:13px;';
+      del.onclick = function () { row.remove(); };
+      row.appendChild(t); row.appendChild(del);
+      gpList.appendChild(row);
+    }
+    cfgPanel.appendChild(gpWrap);
     var references = document.createElement('div');
     references.style.cssText = 'font-size:12px;color:#6b7280;margin:-6px 0 12px 0;';
     cfgPanel.appendChild(references);
@@ -170,6 +216,7 @@ module.exports = {
     function loadConfigIntoPanel() {
       hostApi.callPluginMainAction('getConfig', {}).then(function (r) {
         keyState.textContent = r && r.hasApiKey ? '已配置 Key（输入新值可覆盖）' : '尚未配置 Key';
+        if (r && r.prefLanguage) langSel.value = r.prefLanguage;
       }).catch(function () {});
       hostApi.callPluginMainAction('getAsrConfig', {}).then(function (r) {
         if (!r) return;
@@ -186,7 +233,8 @@ module.exports = {
         cReview.box.checked = !!r.semanticReview;
         cDiag.box.checked = !!r.retainDiagnostics;
         rGlossary.input.value = r.glossary || '';
-        rGpaths.input.value = (r.glossaryPaths || []).join('\n');
+        gpList.innerHTML = '';
+        (r.glossaryPaths || []).forEach(function (p) { addGpathRow(p); });
         references.textContent = '参考资料：粘贴文本 ' + ((r.glossary || '').trim() ? '已配置' : '未配置') + '；文件路径 ' + (r.glossaryPaths || []).length + ' 个（实际读取情况见每次报告）。';
       }).catch(function () {});
     }
@@ -196,7 +244,7 @@ module.exports = {
     };
     saveCfgBtn.onclick = function () {
       var v = rKey.input.value.trim();
-      var gpaths = rGpaths.input.value.split('\n').map(function (s) { return s.trim(); }).filter(Boolean);
+      var gpaths = gpathsAll();
       var jobs = [];
       if (v) jobs.push(hostApi.callPluginMainAction('setConfig', { apiKey: v }));
       jobs.push(hostApi.callPluginMainAction('setAsrConfig', {
@@ -396,6 +444,8 @@ module.exports = {
     root.appendChild(cfgPanel);
     root.appendChild(listWrap);
     hostEl.appendChild(root);
+    /* 语言偏好恢复：不依赖配置面板是否打开过 */
+    hostApi.callPluginMainAction('getConfig', {}).then(function (r) { if (r && r.prefLanguage) langSel.value = r.prefLanguage; }).catch(function () {});
     refreshTasks();
     pollTimer = setInterval(refreshTasks, 5000);
   },

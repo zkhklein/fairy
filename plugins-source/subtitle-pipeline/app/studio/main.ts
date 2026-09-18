@@ -212,7 +212,8 @@ module.exports = {
   async getConfig() {
     var key = await hostApi.secrets.get('deepinfra_api_key');
     /* 兼容旧宿主：secrets.get 可能返回裸字符串而非 {value} */
-    return { ok: true, hasApiKey: !!(key && (typeof key === 'string' ? key : key.value)) };
+    var prefLang = await hostApi.kv.get('config:prefLanguage');
+    return { ok: true, hasApiKey: !!(key && (typeof key === 'string' ? key : key.value)), prefLanguage: ['auto', 'ja', 'en'].includes(prefLang) ? prefLang : 'auto' };
   },
 
   async setConfig(payload) {
@@ -221,6 +222,10 @@ module.exports = {
       await hostApi.secrets.set('deepinfra_api_key', key, 'DeepInfra API Key for subtitle translation');
       /* secrets 按插件隔离：转发给实际取 key 的 llmtranslate（其 getApiKey 读自己的 secrets） */
       await hostApi.plugins.invoke({ pluginId: 'com.fmb.subtitle.llmtranslate', method: 'setConfig', payload: { apiKey: key } });
+    }
+    /* 语言偏好持久化：用户选过日语后不再回退"自动检测" */
+    if (payload && ['auto', 'ja', 'en'].includes(payload.prefLanguage)) {
+      await hostApi.kv.set('config:prefLanguage', payload.prefLanguage);
     }
     return { ok: true };
   },

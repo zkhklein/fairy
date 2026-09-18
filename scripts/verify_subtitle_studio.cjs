@@ -32,6 +32,17 @@ test('retry may explicitly override unknown language; running tasks cannot retry
   assert.equal(JSON.parse(kv.get('tasks'))[0].reviewSummary, '');
   await assert.rejects(api.retryTask({ taskId: 'b' }), /执行/);
 });
+test('language preference persists and survives reload; invalid values fall back to auto', async () => {
+  const { api } = plugin('app/studio');
+  let cfg = await api.getConfig();
+  assert.equal(cfg.prefLanguage, 'auto');
+  await api.setConfig({ prefLanguage: 'ja' });
+  cfg = await api.getConfig();
+  assert.equal(cfg.prefLanguage, 'ja');
+  await api.setConfig({ prefLanguage: 'korean' }); /* 白名单外拒绝 */
+  cfg = await api.getConfig();
+  assert.equal(cfg.prefLanguage, 'ja');
+});
 test('Studio retains task-specific review path and actual requested model', async () => {
   const { api, kv } = plugin('app/studio', { tasks: JSON.stringify([{ taskId: 'a', status: 'translating' }]) });
   await api.storeProgress({ taskId: 'a', reviewPath: 'C:/data/subtitle-reviews/run/review.html', model: 'actual-request-model', sourceLang: 'ja', timelineWarnings: [{ code: 'zero_duration', id: 45, start: '00:05:44,340', end: '00:05:44,340' }] });
