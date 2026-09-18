@@ -122,19 +122,28 @@ test('split retries retain immutable preceding and following context', async t =
   assert.ok(payload.cues.every(c => c.source === 'the blue book.'));
   assert.doesNotMatch(middle.messages[0].content, /30 个汉字/);
 });
-test('optional alignment review rejects shifted content despite complete IDs', async t => {
+test('optional alignment review auto-redoes flagged entries instead of failing', async t => {
   const r = await scenario(t, { params: { semanticReview: true, retainDiagnostics: true }, respond: body => {
     if (body.messages[0].content.includes('对齐复核')) {
       assert.match(body.messages[1].content, /Please bring/);
-      assert.match(body.messages[1].content, /火车中午出发/);
+      assert.match(body.messages[1].content, /初翻/);
       return completion(JSON.stringify([{ id: 1, verdict: 'shifted', reason: '提前翻译了第三条的火车话题' }, { id: 2, verdict: 'ok', reason: '' }, { id: 3, verdict: 'omitted', reason: '内容丢失' }]));
     }
-    return completion('{"translations":[{"id":1,"source":"Please bring","text":"火车中午出发。"},{"id":2,"source":"the blue book.","text":"蓝色的书。"},{"id":3,"source":"The train leaves at noon.","text":"请带来。"}]}');
+    const payload = JSON.parse(body.messages[1].content);
+    if (body.messages[0].content.includes('复核员') && Array.isArray(payload.review_feedback)) {
+      /* 自动重翻请求：只含被点名条目 + 意见反馈，回合法 JSON */
+      assert.ok(payload.cues.length === 2 && payload.review_feedback.length === 2);
+      return completion(JSON.stringify({ translations: payload.cues.map(c => ({ id: c.id, source: c.source, text: '重翻' + c.id })) }));
+    }
+    return completion(translationsJson(body, () => '初翻'));
   } });
-  assert.notEqual(r.code, 0, r.output); assert.equal(r.result.ok, false);
-  assert.match(r.result.error, /复核/);
-  assert.ok(r.result.reviewPath && fs.existsSync(r.result.reviewPath));
-  assert.match(fs.readFileSync(r.result.reviewPath, 'utf8'), /shifted/);
+  assert.equal(r.code, 0, r.output);
+  assert.equal(fs.existsSync(path.join(r.workDir, 'translated.srt')), true);
+  const report = JSON.parse(fs.readFileSync(path.join(path.dirname(r.result.reviewPath), 'review.json'), 'utf8'));
+  const redone = report.entries.filter(e => e.verdict === 'auto-redone');
+  assert.equal(redone.length, 2);
+  assert.ok(redone.every(e => e.reason.includes('复核意见')));
+  assert.ok(report.entries.some(e => e.translation === '重翻1') && report.entries.some(e => e.translation === '重翻3'));
 });
 test('persist escaped review and redacted diagnostics outside disposable workDir', async t => {
   const r = await scenario(t, { srt: srt(['Hello <script>alert(1)</script>.']), params: { retainDiagnostics: true, glossary: 'blue book = 蓝色的书' }, respond: () => completion('{"translations":[{"id":1,"source":"Hello <script>alert(1)</script>.","text":"你好"}]}') });

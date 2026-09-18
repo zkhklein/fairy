@@ -297,7 +297,7 @@
       for (var k2 = 0; k2 < chunk.length; k2++) { chunk[k2].text = translated[k2]; report.entries[offset + k2].translation = translated[k2]; }
       saveReport();
       if (P.semanticReview) {
-        var reviewMessages = [{ role: 'system', content: '你是字幕对齐复核员。逐 ID 对照原文与译文及相邻语境，检查含义提前/挪后(shifted)、信息省略(omitted)、不能确定(uncertain)，否则 ok。编号齐全不等于语义正确，跨行半句允许自然表达，但不得挪用其他 ID 的含义。不改写译文。只输出 JSON 数组，每个待复核 ID 恰好一次：{"id":整数,"verdict":"ok|shifted|omitted|uncertain","reason":"依据"}。' }, { role: 'user', content: context(offset, chunk.length) + '\n\n【待复核】\n' + JSON.stringify(report.entries.slice(offset, offset + chunk.length)) }];
+        var reviewMessages = [{ role: 'system', content: '你是字幕对齐复核员。逐 ID 对照原文与译文及相邻语境，检查含义提前/挪后(shifted)、信息省略(omitted)，否则 ok。编号齐全不等于语义正确，跨行半句允许自然表达，但不得挪用其他 ID 的含义。不改写译文。只输出 JSON 数组，每个待复核 ID 恰好一次：{"id":整数,"verdict":"ok|shifted|omitted","reason":"依据"}。' }, { role: 'user', content: context(offset, chunk.length) + '\n\n【待复核】\n' + JSON.stringify(report.entries.slice(offset, offset + chunk.length)) }];
         var reviewed = await callWithRetry(cfg, reviewMessages, 0);
         tokenBox.total += reviewed.usage.total_tokens || 0;
         var judgments;
@@ -305,11 +305,39 @@
         var reviewIds = new Set(chunk.map(function (e) { return e.id; }));
         if (!Array.isArray(judgments) || judgments.length !== chunk.length) throw fatal('对齐复核编号集合不完整');
         judgments.forEach(function (j) {
-          if (!j || !reviewIds.delete(j.id) || !['ok', 'shifted', 'omitted', 'uncertain'].includes(j.verdict) || typeof j.reason !== 'string') throw fatal('对齐复核编号/结论无效');
+          if (!j || !reviewIds.delete(j.id) || !['ok', 'shifted', 'omitted'].includes(j.verdict) || typeof j.reason !== 'string') throw fatal('对齐复核编号/结论无效');
           var row = report.entries.find(function (e) { return e.id === j.id; }); row.verdict = j.verdict; row.reason = j.reason;
         });
+        /* shifted/omitted 自动重翻（带复核意见反馈），不再二轮复核防循环；仍受 source 逐字契约保护 */
+        var bad = judgments.filter(function (j) { return j.verdict !== 'ok'; });
+        if (bad.length) {
+          var badIds = new Set(bad.map(function (j) { return j.id; }));
+          var redoCues = [];
+          for (var i2 = offset; i2 < offset + chunk.length; i2++) if (badIds.has(entries[i2].id)) redoCues.push({ id: entries[i2].id, source: origTexts[i2] });
+          var redoPayload = {
+            reference: glossary,
+            before_context: entries.slice(Math.max(0, offset - 3), offset).map(function (e, i3) { return { id: e.id, source: origTexts[Math.max(0, offset - 3) + i3] }; }),
+            cues: redoCues,
+            after_context: entries.slice(offset + chunk.length, offset + chunk.length + 3).map(function (e, i4) { return { id: e.id, source: origTexts[offset + chunk.length + i4] }; }),
+            review_feedback: bad.map(function (j) { return { id: j.id, problem: j.verdict, reason: j.reason }; }),
+          };
+          var redoMsgs = [
+            { role: 'system', content: buildSystem(src) + '\n以下是复核员对上一版译文的意见，请针对被点名条目严格修正（只译被点名条目，不得挪用其他条目含义）：' + JSON.stringify(bad.map(function (j) { return { id: j.id, problem: j.verdict, reason: j.reason }; })) },
+            { role: 'user', content: JSON.stringify(redoPayload) },
+          ];
+          var redo = await callWithRetry(cfg, redoMsgs, 0.15);
+          tokenBox.total += (redo.usage && redo.usage.total_tokens) || 0;
+          var redoMap = parseTranslations(redo.content, redoCues);
+          bad.forEach(function (j) {
+            var i5 = entries.findIndex(function (e) { return e.id === j.id; });
+            entries[i5].text = redoMap[j.id];
+            var row2 = report.entries.find(function (e) { return e.id === j.id; });
+            row2.translation = redoMap[j.id];
+            row2.verdict = 'auto-redone';
+            row2.reason = '复核意见: ' + j.reason + '（已自动重翻，请人工抽查）';
+          });
+        }
         saveReport();
-        if (judgments.some(function (j) { return j.verdict !== 'ok'; })) throw fatal('对齐复核发现串位、省略或不确定内容；请查看对照报告，未写出最终字幕。');
       }
       await postInvoke(meta, P.studioPluginId, 'storeProgress', { taskId: P.taskId, stage: 'translating', text: '翻译中 · 块 ' + (ci + 1) + '/' + chunks.length });
       await postInvoke(meta, P.callbackPluginId, 'storeProgress', { taskId: P.taskId, ts: Date.now() });
